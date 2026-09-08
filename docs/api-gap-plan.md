@@ -184,12 +184,16 @@ Good first PRs, independent of the milestones:
    (`name`/`apiVersion`/`createdOn`) nor per-variable `dimension_names`,
    both required by the C++ v3 reader. Either tolerate missing metadata
    with defaults in C++, or contribute the metadata writing to mdio-python.
-4. **Domain origin semantics.** The switch from the brian-michell
-   tensorstore fork to google/tensorstore (`917edaf34`) made index domains
-   strictly 0-based; the fork produced non-zero origins matching coordinate
-   values. Absolute-coordinate slicing patterns written against the fork
-   now break. Document the semantics and decide: restore non-zero origins
-   or declare 0-based + value-based `sel` (M3) as the supported path.
+4. **Domain origin semantics.** Open-variable index domains are 0-based
+   `[0, shape)` — zarr has no origin concept, and this holds on both the
+   previous brian-michell fork pin (branch `v0.1.63_latest` @ `457285c`,
+   July 2024, unmoved; 0-based `GetChunkGridBounds`) and
+   google/tensorstore. Sliced variables carry offset domains (slicing
+   `[0,383)` with `{83,383}` yields domain `[83,383)`) — the real
+   non-zero-origin scenario behind the `b5e42fc` clamp fix. The gap is that
+   consumer code conflates coordinate VALUES with domain INDICES; `sel` by
+   value (M3) is the supported fix. Document the value-vs-index semantics
+   explicitly.
 5. **(External) tensorstore `IterateOverArrays` regression** at
    `917edaf34`: void- AND bool-returning lambdas get one callback per 1-D
    array; 2-D arrays segfault inside `SimpleLoopTemplate::Loop`. Usage
