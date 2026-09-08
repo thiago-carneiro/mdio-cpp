@@ -194,12 +194,19 @@ Good first PRs, independent of the milestones:
    consumer code conflates coordinate VALUES with domain INDICES; `sel` by
    value (M3) is the supported fix. Document the value-vs-index semantics
    explicitly.
-5. **(External) tensorstore `IterateOverArrays` regression** at
-   `917edaf34`: void- AND bool-returning lambdas get one callback per 1-D
-   array; 2-D arrays segfault inside `SimpleLoopTemplate::Loop`. Usage
-   matches tensorstore's own `examples/map_apply.cc`. File upstream against
-   google/tensorstore with a minimal reproducer; no action in this repo
-   beyond avoiding `IterateOverArrays`.
+ 5. **(Withdrawn — not a tensorstore bug.)** Initially filed here as an
+    "(External) tensorstore `IterateOverArrays` regression" at `917edaf34`
+    (one callback per 1-D array; 2-D segfault). Refuted on Sep/8/2026 while
+    preparing the upstream issue: the "minimal reproducer" had replicated the
+    consumer program's own undefined behavior — binding an `ArrayView` (which
+    holds an **unowned reference** to its layout) to a **temporary**
+    `StridedLayout`, leaving the view dangling after the declaration
+    statement. With a named layout, `IterateOverArrays` passes all 1-D/2-D
+    void/bool cases at -O2; the consumer program was fixed by naming its
+    layout (formato-dados `trace_reader_il_xl`, now exit=0). No upstream
+    issue; no action in this repo. Lesson: a reproducer that copies the
+    pattern under test copies its bugs too — the control must eliminate the
+    consumer's UB before blaming the library.
 
 ## Sequencing
 
