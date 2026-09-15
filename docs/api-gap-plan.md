@@ -84,7 +84,7 @@ Every downstream reader hand-rolls the same triple loop with edge clamping.
 A 985-line draft iterator exists downstream and can be ported.
 
 ```cpp
-// mdio/variable.h (or mdio/chunk_iterator.h)
+// mdio/chunk_iterator.h (new header — variable.h is ~2000 lines already)
 /// STL-compatible forward iteration over the variable's chunk grid.
 /// Yields Box<> with absolute domain indices; edge chunks yield partial
 /// boxes. Range-for support.
@@ -94,18 +94,29 @@ ChunkRange Variable::chunks() const;
 
 Design notes:
 
-- Derive the grid from `domain()` + `get_chunk_shape()`.
+- Derive the grid from `dimensions()` (variable.h:1141) +
+  `get_chunk_shape()` (variable.h:1433).
 - Boxes are absolute w.r.t. the index domain (see "Domain origin semantics"
   below — domains are 0-based today).
 - Edge chunks: partial boxes, never out-of-bounds indices.
+- Policy — what the API exposes: the PHYSICAL chunk grid of the stored
+  format. v2/v3 differences are normalized by `get_chunk_shape()`
+  (variable.h:1453-1478); stores without `chunkGrid` fall back to
+  single-chunk-per-array (dataset_factory.h:529-547). Traversal order is
+  row-major over the grid and is NOT a contract. Rechunk/reformat changes
+  the iteration; that is intended.
+- This milestone is API ergonomics, not an I/O optimization: the read path
+  stays `tensorstore::Read(store)` (variable.h:1078-1083). The measured
+  per-task cost is M7's scope; M2's iterator is the substrate M7's bulk
+  API builds on. Do NOT adopt one-box-per-chunk as the default read
+  pattern — the evaluation measured 383 small tasks at 56 min vs 0.75 s
+  single-task on NFS.
 
 Tests: shapes not divisible by the chunk shape; rank 1–4; 0-sized dims
-rejected.
+rejected; domains with offset (post-`isel` — see fix 4).
 
 Acceptance: downstream trace reader ≤120 lines (from 358) with no manual
-chunk loops.
-
-Size: medium-large (draft exists).
+chunk loops, byte-identical output to the current workaround.
 
 ## M3 — Value-based selection: `Dataset::sel()`
 
