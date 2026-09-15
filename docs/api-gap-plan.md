@@ -203,18 +203,33 @@ need is element-wise transforms without per-dtype switch statements
 (downstream keeps a 628-line dispatch table for this).
 
 ```cpp
-/// Applies fn element-wise during src → dst transfer, dtype-erased.
-absl::Status TransformVariable(const Variable<>& src, Variable<>& dst,
-                               ElementTransform fn);
+// mdio/variable.h
+/// Element-wise transform during src → dst transfer, dtype-erased.
+/// fn receives ONE element of src's dtype as raw bytes (length =
+/// src dtype itemsize) and writes the transformed element to dst_bytes.
+/// For structured dtypes the unit is the whole record (the versioned
+/// struct paths already exist, zarr.h:243-266). Async like the rest of
+/// the I/O surface: composes with WriteFutures (variable.h:1127-1128).
+using ElementTransform = absl::AnyInvocable<absl::Status(
+    std::string_view src_bytes, std::string_view dst_bytes) const>;
+Future<absl::Status> TransformVariable(const Variable<>& src,
+                                       Variable<>& dst,
+                                       ElementTransform fn);
 ```
 
-Decide after M1 lands how much of this is still needed.
+Contract notes: the API is a pure per-element map — reversible iff `fn` is;
+no cross-element state. Decide after M1 lands how much of this is still
+needed.
 
 ## M6 — Execution layer (proposal stage)
 
 `MapChunks(variable, fn, ParallelOptions)` over TensorStore futures. Not
 scheduled: downstream keeps external orchestration (Parsl/Slurm) until the
-core gaps are closed. Draft proposal exists downstream.
+core gaps are closed. Draft proposal exists downstream. If it is ever
+scheduled, it must specify region fusion/batching, open-handle reuse, and
+metadata caching — the evaluation measured the cost in per-task work
+(metadata round-trips), not in missing parallelism (K=8 did not degrade),
+so a chunk-level scheduler alone addresses the wrong bottleneck (see M7).
 
 ## Small fixes (verified against `fcbfb85`)
 
