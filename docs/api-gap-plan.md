@@ -244,11 +244,23 @@ Good first PRs, independent of the milestones:
    trailing slash" because version detection fails silently and the flow
    falls back to v2. Detect the missing `zarr.json` first and say "not an
    MDIO store or path does not exist".
-3. **Interop: mdio-python 1.x stores lack required metadata.** mdio-python
-   `to_mdio` writes neither the root dataset metadata
-   (`name`/`apiVersion`/`createdOn`) nor per-variable `dimension_names`,
-   both required by the C++ v3 reader. Either tolerate missing metadata
-   with defaults in C++, or contribute the metadata writing to mdio-python.
+3. **Interop: mdio-python 1.x stores lack required dataset metadata.**
+   Verified against mdio-python 1.0.8 (probe, 2026-09-14): a fresh
+   `to_mdio` write emits no `name`/`apiVersion`/`createdOn` anywhere in
+   the root metadata (root `zarr.json` `attributes` is `{}`), while
+   per-variable `dimension_names` IS written directly (the legacy
+   `_ARRAY_DIMENSIONS` form is converted by the C++ v3 reader anyway,
+   zarr_v3.h:769-785 — it is not a gap). The C++ v3 reader requires all
+   three dataset fields (dataset_schema.h:368-372), so fresh py-written
+   stores fail its required-field validation (the evaluation's interop
+   finding). Round-trip stores fail differently: `open_mdio` stamps
+   `createdOn` into Dataset attrs (`xarray_builder.py:267`, space
+   separator) and `to_mdio` passes it through — the C++ rejects it as
+   non-RFC-3339 (companion mdio-python Issue 03, already prepared
+   upstream). Policy — lenient reader: the C++ v3 reader tolerates
+   missing `name`/`apiVersion`/`createdOn` with defaults and a warning;
+   stores mdio-cpp itself writes keep the full metadata. Contributing
+   default metadata writing to mdio-python is a follow-up, not a blocker.
 4. **Domain origin semantics.** Open-variable index domains are 0-based
    `[0, shape)` — zarr has no origin concept, and this holds on both the
    previous brian-michell fork pin (branch `v0.1.63_latest` @ `457285c`,
