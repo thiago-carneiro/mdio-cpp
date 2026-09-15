@@ -231,6 +231,40 @@ metadata caching — the evaluation measured the cost in per-task work
 (metadata round-trips), not in missing parallelism (K=8 did not degrade),
 so a chunk-level scheduler alone addresses the wrong bottleneck (see M7).
 
+## M7 — Metadata-path performance (measured bottleneck)
+
+The evaluation measured the dominant I/O cost in the per-task metadata
+path, not in byte transfer: reading 16 chunks issues ~12k metadata syscalls
+(`openat`/`getdents64`); per-task cost is linear in the total chunk-file
+count (41× between granularity-equivalent grids; additive model
+`0.07 s + 0.0025 s × source chunk files + 0.0026 s × accumulated
+destination files`); 383 small tasks cost 56 min vs 0.75 s single-task on
+NFS. None of M1–M6 touches this path — without this milestone the roadmap
+can complete without moving the measured cost.
+
+Deliverables (the evaluation's recorded fix directions):
+
+1. **Direct chunk-key addressing** — construct chunk keys from the stored
+   grid instead of directory listing (removes the `getdents64` walks).
+2. **In-process metadata lookup cache** — positive and negative entries
+   (a failed existence check must not re-hit the store).
+3. **Bulk region reads** — a multi-region API on M2's iterator substrate:
+   one open-handle set, many boxes (M2's one-box-per-chunk must not become
+   the default read pattern).
+
+Performance gates (apply to every milestone that touches the I/O path —
+M2, M5, M6, M7): per-region latency, metadata-syscall count per read, and
+loss of the linear dependence on source chunk-file count — measured on the
+NFS backend. The effect is NFS-metadata-bound; on local SSD it collapses,
+so the gates are backend-specific and say so.
+
+Acceptance: the 383-task distributed case drops from 56 min to the
+single-digit minutes predicted by the cost model with the metadata term
+removed; byte-identical outputs to the current workaround.
+
+Size: large; needs a benchmark harness first (the evaluation's probe
+programs are the starting point).
+
 ## Small fixes (verified against `fcbfb85`)
 
 Good first PRs, independent of the milestones:
@@ -289,10 +323,10 @@ Good first PRs, independent of the milestones:
 
 | Wave | Items | Unlocks downstream |
 |---|---|---|
-| 0 | Small fixes 1–3 | trust in error messages; mdio-python interop |
-| 1 | M1 `to_json` | ~700 lines deleted; copy programs collapse |
-| 2 | M2 chunks | all readers collapse |
-| 3 | M3 `sel` | ROI selection collapses |
+| 0 | Small fixes 1–4 | trust in error messages; mdio-python interop; domain-origin semantics settled before M2/M3 depend on it |
+| 1 | M7 metadata-path + M1 `to_json` | measured I/O cost addressed; ~700 lines deleted; copy programs collapse |
+| 2 | M2 chunks (on M7's bulk substrate) | all readers collapse |
+| 3 | M3 `sel` completion | ROI selection collapses |
 | 4 | M4 stats | readers lose accumulators |
 | 5 | M5/M6 | transfer/execution (re-evaluate after M1) |
 
@@ -302,7 +336,8 @@ Good first PRs, independent of the milestones:
    on-disk results (a store written by either implementation must round-trip
    in the other).
 2. **Every PR ships tests** plus a stated downstream acceptance criterion
-   (program line-count target or deleted workaround).
+   (program line-count target or deleted workaround); I/O-touching PRs
+   additionally carry a performance gate (see M7).
 3. **No breaking changes without a deprecation note** — the API is pre-1.0
    but downstream pins exist.
 4. **Interop tests are two-directional** (mdio-python-written stores open in
