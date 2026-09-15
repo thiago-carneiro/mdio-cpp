@@ -3,11 +3,13 @@
 Status: draft (Sep 2026) · Base: `fcbfb85` (v0.2.0-pre-release)
 
 This is the library-side plan for closing the API gaps between mdio-cpp and
-mdio-python. The gaps were cataloged by a downstream consumer suite: 12
-example programs (~5.5k lines of C++ against ~2k lines of equivalent Python),
-where an estimated 60–70% of the C++ code exists only to work around these
-gaps. Every item below lists the API to add, where it lands, and a measurable
-acceptance criterion expressed as downstream code shrinkage.
+mdio-python. The gaps were cataloged by a downstream consumer suite: 22
+distinct example programs by the end of the evaluation (10 at the close of
+its Phase 0), where an estimated 60–70% of the C++ code exists only to work
+around these gaps. Every item below lists the API to add or complete, where
+it lands, and a measurable acceptance criterion expressed as downstream code
+shrinkage. Downstream line counts quoted per item come from the evaluation
+corpus and are not independently audited in this repo.
 
 Reference implementation: mdio-python 1.x (API names, semantics, and on-disk
 interop must match it wherever possible).
@@ -18,10 +20,11 @@ interop must match it wherever possible).
 |---|---|---|---|---|
 | 1 | No serialization round-trip (`to_json`) | `to_mdio(open_mdio(...))` | ~700 lines (hand-built creation JSON) | M1 |
 | 2 | No chunk iteration | xarray/dask lazy chunks | triple nested loops in every reader | M2 |
-| 3 | `sel` by value unimplemented | `dataset.sel(inline=slice(a, b))` | full coordinate reads + manual index math | M3 |
+| 3 | `sel`: `ListDescriptor` blocked; range endpoints require exact value match | `dataset.sel(inline=slice(a, b))` | full coordinate reads + manual index math | M3 |
 | 4 | No statistics computation | `statsV1` on ingest | manual accumulators per trace/slice | M4 |
 | 5 | No dtype-erased transfer | dtype-generic xarray ops | hand-rolled dtype dispatch tables | M5 |
 | 6 | No execution layer | dask schedulers | external orchestration (kept, for now) | M6 |
+| 7 | Per-task I/O cost scales with chunk-file count (metadata path) | — (measured, not a parity gap) | distributed jobs: 56 min vs 0.75 s single-task | M7 |
 
 ## M1 — Serialization round-trip: `Dataset::to_json()`
 
