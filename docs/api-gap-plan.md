@@ -152,25 +152,44 @@ Size: ~3–5 days.
 
 The serialization target already exists (`dataset_schema.h` defines
 `CenteredBinHistogram` with `counts`/`binCenters`; `UserAttributes` already
-scrubs `statsV1`), but nothing computes it.
+scrubs `statsV1`), and so does the result type:
+`mdio::internal::SummaryStats` (stats.h:229-335) has exactly the fields the
+on-disk contract needs — `int32_t count`, `float sum/sumSquares/min/max`,
+`std::unique_ptr<const Histogram>` (stats.h:329-334; `Histogram` is an
+abstract base, stats.h:82-107 — it cannot be a by-value member). What is
+missing is only the computation and a merge for partials.
 
 ```cpp
-// mdio/stats.h
-struct SummaryStats { Index count; double sum, sumSquares, min, max;
-                      Histogram histogram; };
+// mdio/stats.h — reuse mdio::internal::SummaryStats; do NOT add a second
+// struct with the same name and different field types.
 /// Incremental (chunk-composable) computation over a variable.
 Result<SummaryStats> ComputeStats(const Variable<>& var);
-/// Persists as statsV1 user attributes (mdio-python compatible).
-absl::Status Variable::UpdateAttributes(const SummaryStats&);
+/// Order-independent combination of partials from distributed callers.
+Result<SummaryStats> MergeStats(absl::Span<const SummaryStats> partials);
 ```
+
+Publishing path — no new `UpdateAttributes` overload. The existing
+`VariableBase::UpdateAttributes(const nlohmann::json&)` (variable.h:881-889,
+returns `Result<void>`) stays the only attribute writer, and per its own
+doc comment it does NOT persist; durability goes through
+`Dataset::CommitMetadata`. `UserAttributes` already has constructors from
+stats collections (stats.h:547-549, 570-573), so the flow is:
+`ComputeStats` → serialize to the statsV1 JSON shape → existing
+`UpdateAttributes(json)` → `CommitMetadata`.
+
+Policy change, declared: stats.h:69-72 documents that there is no easy path
+to add a histogram to an existing `UserAttributes`. This milestone adds one
+(via the constructors above) — a deliberate revert of that design note,
+called out here so PR review sees it.
 
 Design notes:
 
-- Incremental accumulation so distributed callers can reduce partials.
+- Field types follow statsV1 exactly (int32 count, float accumulators) —
+  `double`/`Index` variants would truncate on persistence.
 - Schema-compatible with mdio-python `builder/schemas/v1/stats.py`.
 
 Tests: known distributions; empty variables; float32 vs float64; histogram
-edges.
+edges; merge of partials equals single-pass computation.
 
 Acceptance: downstream il/xl reader ≤150 lines (from 532); statsV1 written
 by C++ reads back in mdio-python.
