@@ -28,36 +28,53 @@ interop must match it wherever possible).
 
 ## M1 — Serialization round-trip: `Dataset::to_json()`
 
-The library has `Dataset::from_json()` (dataset_factory.h) but no inverse.
-Every downstream copy program rebuilds the creation JSON by hand from
-TensorStore specs — including heuristics the library would not need (units
-guessing, invented dimension names), because it lacks access to library
-internals.
+The library has `Dataset::from_json()` (dataset.h:292) but no inverse —
+`to_json` does not exist anywhere in `mdio/`. Every downstream copy program
+rebuilds the creation JSON by hand from TensorStore specs — including
+heuristics the library would not need (units guessing, invented dimension
+names), because it lacks access to library internals.
 
 ```cpp
 // mdio/dataset.h
-/// Serializes an open Dataset back to the creation JSON consumed by
-/// from_json(). Round-trip guarantee: from_json(to_json(ds)) opens an
-/// equivalent dataset.
+/// Serializes the LOGICAL schema of an open Dataset — variables (including
+/// header variables), dimension labels, dtypes, chunk grids, and user
+/// attributes — to the creation JSON consumed by from_json(). Store
+/// binding (path, zarr_version, tensorstore Context) is NOT part of the
+/// output: from_json keeps taking those as parameters.
+/// Round-trip guarantee: from_json(to_json(ds), path, version) opens an
+/// equivalent dataset at `path`.
 Result<nlohmann::json> Dataset::to_json(
     IncludeDefaults defaults = {}) const;
 ```
 
 Design notes:
 
-- Build on `Variable::get_spec()` (already returns the TensorStore spec JSON)
-  and translate to the MDIO creation schema: dtype names, compressor
-  normalization, `chunkGrid` from chunks, `dimension_names` from domain
-  labels, `UserAttributes` round-tripped from stored array metadata.
+- Build on `Variable::get_spec()` (variable.h:1406) and translate to the
+  MDIO creation schema: dtype names, compressor normalization, `chunkGrid`
+  from chunks, `dimension_names` from domain labels, `UserAttributes`
+  round-tripped from stored array metadata.
+- Header variables are part of the round-trip: `Dataset` carries a
+  `HeaderVariableCollection` (dataset.h:172, opened at dataset.h:969-983)
+  and `CommitMetadata` already serializes them via `ToCommitJson()`
+  (dataset.h:1331-1333) — `to_json()` must use the same path, or the
+  round-trip guarantee fails silently for datasets with header variables.
+- Struct-array round-trip has explicit prerequisites outside this plan:
+  the spec derivation for structured variables currently yields `"byte"`
+  (rejected by the creation schema — companion evaluation, Issue 02), and
+  the write-dialect mismatch `"struct"` vs `"structured"` (zarr-python
+  #2134, Issue 01) must land first. Until then the struct-array round-trip
+  test is prerequisite-gated, not expected to pass.
 - Output must validate against `dataset_schema.h` and open in mdio-python.
 - No heuristics: the library has the real metadata; the downstream prototype
   guessed because it did not.
 
 Tests: round-trip open → to_json → from_json → sampling validation; v2 and
-v3 stores; struct arrays.
+v3 stores; datasets WITH header variables; struct arrays (prerequisite-gated,
+see above).
 
-Acceptance: downstream dataset copy ≤60 lines (from 224); the downstream
-`variable_spec_builder` (~460 lines) is deleted.
+Acceptance: downstream dataset copy ≤60 lines (from 224) with byte-identical
+output to the current workaround; the downstream `variable_spec_builder`
+(~460 lines) is deleted.
 
 Size: ~300–400 lines + tests. Strongest single PR candidate.
 
