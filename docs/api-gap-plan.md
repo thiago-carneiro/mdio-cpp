@@ -311,29 +311,38 @@ Good first PRs, independent of the milestones:
 1. **Slice error reports the wrong descriptor.** `Variable::slice` prints
    the ORIGINAL descriptor (`start=1004 > stop=1304` — a false comparison)
    while the check failed on the CLAMPED one. Report the clamped values
-   (variable.h, slice loop).
+   (variable.h, slice loop). *(Implemented, wave 0: `1918f3a`.)*
 2. **Missing store misreported as `.zmetadata` parse error.** Opening a
    non-existent store yields "Failed to parse .zmetadata. Try adding a
    trailing slash" because version detection fails silently and the flow
    falls back to v2. Detect the missing `zarr.json` first and say "not an
-   MDIO store or path does not exist".
+   MDIO store or path does not exist". *(Implemented, wave 0: `d9a8a41` —
+   `DetectVersion` errors when no store markers exist; `from_zmetadata`
+   propagates it.)*
 3. **Interop: mdio-python 1.x stores lack required dataset metadata.**
    Verified against mdio-python 1.0.8 (probe, 2026-09-14): a fresh
    `to_mdio` write emits no `name`/`apiVersion`/`createdOn` anywhere in
    the root metadata (root `zarr.json` `attributes` is `{}`), while
    per-variable `dimension_names` IS written directly (the legacy
    `_ARRAY_DIMENSIONS` form is converted by the C++ v3 reader anyway,
-   zarr_v3.h:769-785 — it is not a gap). The C++ v3 reader requires all
-   three dataset fields (dataset_schema.h:368-372), so fresh py-written
-   stores fail its required-field validation (the evaluation's interop
-   finding). Round-trip stores fail differently: `open_mdio` stamps
+   zarr_v3.h:769-785 — it is not a gap). The required-field validation
+   (dataset_schema.h:368-372) is reachable only on the CREATE path
+   (`Construct`, dataset_factory.h:711, via `from_json`); plain
+   `Dataset::Open(path)` opens such stores (verified empirically,
+   2026-09-16). The evaluation's interop failure fired on the consumer
+   flow open → derive creation spec → `from_json`. Round-trip stores
+   fail differently: `open_mdio` stamps
    `createdOn` into Dataset attrs (`xarray_builder.py:267`, space
    separator) and `to_mdio` passes it through — the C++ rejects it as
    non-RFC-3339 (companion mdio-python Issue 03, already prepared
-   upstream). Policy — lenient reader: the C++ v3 reader tolerates
-   missing `name`/`apiVersion`/`createdOn` with defaults and a warning;
-   stores mdio-cpp itself writes keep the full metadata. Contributing
+   upstream). Policy — lenient reader: `Dataset::Open(path)` warns on
+   missing `name`/`apiVersion`/`createdOn` (implemented, wave 0); the
+   create path stays strict; stores mdio-cpp itself writes keep the full
+   metadata. Contributing
    default metadata writing to mdio-python is a follow-up, not a blocker.
+   *(Implemented, wave 0: `9ffa795` — warning at `Dataset::Open(path)`;
+   the mechanism text above was corrected from the plan's original claim:
+   the read path never rejected the fields, the create path does.)*
 4. **Domain origin semantics.** Open-variable index domains are 0-based
    `[0, shape)` — zarr has no origin concept, and this holds on both the
    previous brian-michell fork pin (branch `v0.1.63_latest` @ `457285c`,
