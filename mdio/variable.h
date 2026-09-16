@@ -1314,10 +1314,12 @@ class Variable : public VariableBase {
     steps.reserve(N);
 
     int8_t bad_idx = -1;
+    RangeDescriptor<Index> bad_d = {};
     for (size_t i = 0; i < N; ++i) {
       auto d = sliceInRange(descs[i]);
       if (d.start > d.stop) {
         bad_idx = static_cast<int8_t>(i);
+        bad_d = d;
         break;
       }
       if (this->hasLabel(d.label)) {
@@ -1328,11 +1330,11 @@ class Variable : public VariableBase {
       }
     }
     if (bad_idx >= 0) {
-      auto& err = descs[bad_idx];
+      // Report the clamped descriptor: it is what failed the check above.
       return Result<Variable>{absl::InvalidArgumentError(
           std::string("Slice descriptor for ") +
-          std::string(err.label.label()) + " is invalid: start=" +
-          std::to_string(err.start) + " > stop=" + std::to_string(err.stop))};
+          std::string(bad_d.label.label()) + " is invalid: start=" +
+          std::to_string(bad_d.start) + " > stop=" + std::to_string(bad_d.stop))};
     }
 
     // 3) Fast path: all labels (or axis indices) are unique

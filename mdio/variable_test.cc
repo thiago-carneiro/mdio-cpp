@@ -849,6 +849,28 @@ TEST(Variable, outOfBoundsSlice) {
   EXPECT_TRUE(legal.status().ok()) << legal.status();
 }
 
+// A descriptor past the end of the domain is clamped before the start > stop
+// precondition is checked, so the error must report the clamped values that
+// actually failed the check, not the original descriptor values.
+TEST(Variable, sliceErrorReportsClampedDescriptor) {
+  auto json_spec = json_good;
+  json_spec["metadata"]["shape"] = {383, 383};
+  json_spec["kvstore"]["path"] = "slice_error_clamped";
+
+  auto var =
+      mdio::Variable<>::Open(json_spec, mdio::constants::kCreateClean).result();
+  ASSERT_TRUE(var.ok()) << var.status();
+
+  mdio::RangeDescriptor<mdio::Index> past_end = {"x", 400, 500, 1};
+  auto result = var.value().slice(past_end);
+  ASSERT_FALSE(result.status().ok());
+
+  EXPECT_THAT(result.status().message(),
+              ::testing::HasSubstr("start=400 > stop=383"));
+  EXPECT_THAT(result.status().message(),
+              ::testing::Not(::testing::HasSubstr("stop=500")));
+}
+
 TEST(Variable, noIntervals) {
   auto varRes =
       mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
