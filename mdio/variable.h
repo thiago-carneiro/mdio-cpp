@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "absl/strings/str_split.h"
+#include "mdio/chunk_iterator.h"
 #include "mdio/impl.h"
 #include "mdio/stats.h"
 #include "mdio/zarr/zarr.h"
@@ -1488,6 +1489,46 @@ class Variable : public VariableBase {
     }
 
     return absl::NotFoundError("Metadata did not contain chunk shape.");
+  }
+
+  /**
+   * @brief Iterates over the variable's chunk grid.
+   *
+   * Yields tensorstore::Box values with absolute indices into the variable's
+   * index domain; edge chunks yield partial boxes, never out-of-bounds
+   * indices. The grid is derived from the stored format's chunk shape
+   * (get_chunk_shape()), so a rechunked or reformatted store changes the
+   * iteration; that is intended. Traversal order is row-major and is not a
+   * contract.
+   *
+   * The grid is anchored at the domain origin: a freshly opened variable's
+   * domain is 0-based, so the boxes coincide with the stored format's
+   * physical chunk grid; a sliced variable's domain carries an offset and the
+   * grid is tessellated over that offset domain starting at its origin.
+   *
+   * This is API ergonomics, not an I/O pattern: the read path stays
+   * `tensorstore::Read(store)`. Do not adopt one-box-per-chunk as the default
+   * read pattern.
+   * @details \b Usage
+   * @code
+   * MDIO_ASSIGN_OR_RETURN(auto chunks, velocity.chunks());
+   * for (const auto& chunk : chunks) {
+   *   // chunk.origin() and chunk.shape() are absolute domain indices.
+   * }
+   * @endcode
+   * @return An `mdio::Result` object containing the chunk range; NotFoundError
+   * if the stored metadata carries no chunk shape, InvalidArgumentError if
+   * the domain has a non-positive dimension size.
+   */
+  Result<ChunkRange> chunks() const {
+    auto domain = dimensions();
+    std::vector<Index> domain_origin(domain.origin().begin(),
+                                     domain.origin().end());
+    std::vector<Index> domain_shape(domain.shape().begin(),
+                                    domain.shape().end());
+    MDIO_ASSIGN_OR_RETURN(auto chunk_shape, get_chunk_shape());
+    return ChunkRange::Create(std::move(domain_origin), std::move(domain_shape),
+                              std::move(chunk_shape));
   }
 
   /**

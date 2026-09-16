@@ -20,8 +20,10 @@
 #include <cmath>  // For checking NaN values
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "mdio/zarr/zarr.h"
@@ -1368,6 +1370,167 @@ TEST(VariableData, fromVariableFillTest) {
 }
 
 // ============================================================================
+// ChunkRange / Variable::chunks() tests
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Sum of per-chunk element counts; must equal the domain volume.
+ */
+mdio::Index TotalChunkElements(const mdio::ChunkRange& chunks) {
+  mdio::Index total = 0;
+  for (const auto& chunk : chunks) {
+    total += chunk.num_elements();
+  }
+  return total;
+}
+
+/**
+ * @brief True if the box is a non-empty subset of the half-open domain.
+ */
+bool BoxWithinDomain(const tensorstore::Box<>& box,
+                     const std::vector<mdio::Index>& domain_origin,
+                     const std::vector<mdio::Index>& domain_shape) {
+  for (std::size_t i = 0; i < domain_origin.size(); ++i) {
+    if (box.shape()[i] <= 0) {
+      return false;
+    }
+    if (box.origin()[i] < domain_origin[i]) {
+      return false;
+    }
+    if (box.origin()[i] + box.shape()[i] > domain_origin[i] + domain_shape[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST(ChunkRange, edgeChunksArePartial) {
+  // 10, 7 and 3 are not divisible by 4, 3 and 5: every dimension has a
+  // partial edge chunk.
+  auto chunks = mdio::ChunkRange::Create({0, 0, 0}, {10, 7, 3}, {4, 3, 5});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  EXPECT_EQ(chunks->size(), 9);  // ceil(10/4) * ceil(7/3) * ceil(3/5) = 3*3*1
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(0, 0, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(4, 3, 3));
+
+  // Row-major: the last chunk is the partial edge along every dimension.
+  auto last = chunks->begin();
+  for (std::size_t i = 1; i < chunks->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(8, 6, 0));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(2, 1, 3));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {0, 0, 0}, {10, 7, 3}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 10 * 7 * 3);
+}
+
+TEST(ChunkRange, rank1Through4) {
+  // Rank 1: partial edge chunk [8, 10).
+  auto rank1 = mdio::ChunkRange::Create({0}, {10}, {4});
+  ASSERT_TRUE(rank1.ok()) << rank1.status();
+  EXPECT_EQ(rank1->size(), 3);
+  EXPECT_EQ(TotalChunkElements(*rank1), 10);
+
+  // Rank 2: chunk larger than the first dimension collapses it to one chunk.
+  auto rank2 = mdio::ChunkRange::Create({0, 0}, {5, 6}, {5, 4});
+  ASSERT_TRUE(rank2.ok()) << rank2.status();
+  EXPECT_EQ(rank2->size(), 2);
+  EXPECT_EQ(TotalChunkElements(*rank2), 5 * 6);
+
+  // Rank 3.
+  auto rank3 = mdio::ChunkRange::Create({0, 0, 0}, {3, 4, 5}, {2, 2, 3});
+  ASSERT_TRUE(rank3.ok()) << rank3.status();
+  EXPECT_EQ(rank3->size(), 8);
+  EXPECT_EQ(TotalChunkElements(*rank3), 3 * 4 * 5);
+
+  // Rank 4.
+  auto rank4 =
+      mdio::ChunkRange::Create({0, 0, 0, 0}, {2, 3, 4, 5}, {1, 2, 2, 3});
+  ASSERT_TRUE(rank4.ok()) << rank4.status();
+  EXPECT_EQ(rank4->size(), 16);
+  EXPECT_EQ(TotalChunkElements(*rank4), 2 * 3 * 4 * 5);
+}
+
+TEST(ChunkRange, offsetDomainBoxesAreAbsolute) {
+  // A sliced variable's domain carries an offset (fix 4 semantics): the grid
+  // is anchored at the domain origin and boxes stay inside the domain.
+  auto chunks = mdio::ChunkRange::Create({83, 0}, {250, 500}, {100, 50});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  EXPECT_EQ(chunks->size(), 30);  // ceil(250/100) * ceil(500/50)
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {83, 0}, {250, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 250 * 500);
+}
+
+TEST(ChunkRange, rejectsInvalidGrids) {
+  // Zero-sized domain dimension.
+  auto zero_dim = mdio::ChunkRange::Create({0, 0}, {500, 0}, {100, 50});
+  EXPECT_FALSE(zero_dim.ok());
+
+  // Non-positive chunk size.
+  auto zero_chunk = mdio::ChunkRange::Create({0, 0}, {500, 500}, {100, 0});
+  EXPECT_FALSE(zero_chunk.ok());
+
+  // Rank mismatch between domain and chunk shape.
+  auto rank_mismatch =
+      mdio::ChunkRange::Create({0, 0}, {500, 500, 1}, {100, 50});
+  EXPECT_FALSE(rank_mismatch.ok());
+}
+
+TEST(ChunkRange, stlCompatibility) {
+  auto chunks = mdio::ChunkRange::Create({0, 0}, {10, 10}, {4, 4});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  // Range-based for loop.
+  std::size_t count = 0;
+  for (const auto& chunk : *chunks) {
+    (void)chunk;
+    ++count;
+  }
+  EXPECT_EQ(count, chunks->size());  // 3 * 3
+
+  // std::distance over the iterator pair.
+  EXPECT_EQ(
+      static_cast<std::size_t>(std::distance(chunks->begin(), chunks->end())),
+      chunks->size());
+
+  // Iterator trait surface and category.
+  static_assert(std::is_same<mdio::ChunkIterator::iterator_category,
+                             std::forward_iterator_tag>::value,
+                "ChunkIterator must be a forward iterator");
+  static_assert(
+      std::is_same<mdio::ChunkIterator::value_type, tensorstore::Box<>>::value,
+      "ChunkIterator must yield tensorstore::Box");
+
+  // Copies iterate independently (multi-pass).
+  auto first = chunks->begin();
+  auto copy = first;
+  ++first;
+  ++first;
+  EXPECT_EQ(copy.current_chunk_index(), 0);
+  EXPECT_EQ(first.current_chunk_index(), 2);
+  EXPECT_NE(first, chunks->begin());
+  EXPECT_EQ(copy, chunks->begin());
+}
+
+// ============================================================================
 // Parameterized Variable Tests for V2/V3
 // ============================================================================
 
@@ -1488,6 +1651,94 @@ TEST_P(VariableVersionTest, outOfBoundsSlice) {
   auto badDomain = outbounds.value();
   EXPECT_THAT(badDomain.dimensions().shape(), ::testing::ElementsAre(250, 500))
       << badDomain.dimensions();
+}
+
+TEST_P(VariableVersionTest, chunks) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // Stored chunk shape is [100, 50] on a [500, 500] domain: 5 * 10 chunks.
+  auto chunks = variable.chunks();
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+  EXPECT_EQ(chunks->size(), 50);
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(0, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  // Row-major traversal: chunk 11 is the second chunk along both dimensions.
+  auto second_row = chunks->begin();
+  for (std::size_t i = 0; i < 11; ++i) {
+    ++second_row;
+  }
+  EXPECT_THAT(second_row->origin(), ::testing::ElementsAre(100, 50));
+  EXPECT_THAT(second_row->shape(), ::testing::ElementsAre(100, 50));
+
+  // Every box stays inside the domain and the boxes tile it exactly.
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {0, 0}, {500, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 500 * 500);
+
+  // The boxes are ready for Variable::slice(): slicing by the first box
+  // yields a variable whose domain matches the box.
+  mdio::RangeDescriptor<mdio::Index> desc1 = {
+      "x", first->origin()[0], first->origin()[0] + first->shape()[0], 1};
+  mdio::RangeDescriptor<mdio::Index> desc2 = {
+      "y", first->origin()[1], first->origin()[1] + first->shape()[1], 1};
+  auto sliced = variable.slice(desc1, desc2);
+  ASSERT_TRUE(sliced.ok()) << sliced.status();
+  EXPECT_THAT(sliced->dimensions().origin(), ::testing::ElementsAre(0, 0));
+  EXPECT_THAT(sliced->dimensions().shape(), ::testing::ElementsAre(100, 50));
+}
+
+TEST_P(VariableVersionTest, chunksOnSlicedOffsetDomain) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // Slice x to [83, 333): the domain carries an offset (fix 4 semantics).
+  mdio::RangeDescriptor<mdio::Index> desc = {"x", 83, 333, 1};
+  auto sliced = variable.slice(desc);
+  ASSERT_TRUE(sliced.ok()) << sliced.status();
+  EXPECT_THAT(sliced->dimensions().origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(sliced->dimensions().shape(), ::testing::ElementsAre(250, 500));
+
+  auto chunks = sliced->chunks();
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  // Grid anchored at the offset domain origin: 3 chunks along x (the last
+  // one partial: [283, 333)) and 10 along y.
+  EXPECT_EQ(chunks->size(), 30);
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  auto last = chunks->begin();
+  for (std::size_t i = 1; i < chunks->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(283, 450));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(50, 50));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {83, 0}, {250, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 250 * 500);
+}
+
+TEST_P(VariableVersionTest, chunksRejectsZeroSizedDimension) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  spec["metadata"]["shape"] = nlohmann::json::array({500, 0});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).result();
+  ASSERT_TRUE(variable.ok()) << variable.status();
+
+  auto chunks = variable->chunks();
+  ASSERT_FALSE(chunks.ok());
+  EXPECT_EQ(chunks.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 INSTANTIATE_TEST_SUITE_P(
