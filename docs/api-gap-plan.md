@@ -352,7 +352,7 @@ Good first PRs, independent of the milestones:
    non-zero-origin scenario behind the `b5e42fc` clamp fix. The gap is that
    consumer code conflates coordinate VALUES with domain INDICES; `sel` by
    value (M3) is the supported fix. Document the value-vs-index semantics
-   explicitly.
+   explicitly. *(Implemented, wave 0: `554bfab`.)*
  5. **(Withdrawn — not a tensorstore bug.)** Initially filed here as an
     "(External) tensorstore `IterateOverArrays` regression" at `917edaf34`
     (one callback per 1-D array; 2-D segfault). Refuted on Sep/8/2026 while
