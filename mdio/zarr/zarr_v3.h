@@ -59,6 +59,25 @@ constexpr std::string_view kGroupNodeType = "group";
  */
 constexpr std::string_view kArrayNodeType = "array";
 
+/**
+ * @brief The attributes key holding the variable index in the root zarr.json.
+ *
+ * Site decision: the index lives INSIDE `attributes`, not in a dedicated
+ * root-level field. The Zarr V3 core spec defines `attributes` as free-form
+ * ("The object may contain any key/value pairs ... arbitrary user metadata"),
+ * so every reader (zarr-python, mdio-python, older mdio-cpp) tolerates it.
+ * A dedicated root-level field, in contrast, hits the spec's unknown-field
+ * rule ("An implementation MUST fail to open Zarr groups or arrays if any
+ * metadata fields are present which the implementation does not recognize
+ * and ... are not explicitly set to must_understand: false"), and the spec
+ * explicitly discourages `must_understand: false` for top-level keys. The
+ * spec's `consolidated_metadata` field was rejected because its `metadata`
+ * member must hold full child metadata documents, which would duplicate
+ * every variable's zarr.json in the root while mdio's open path re-reads
+ * each `NAME/zarr.json` anyway (the TensorStore spec points at it).
+ */
+constexpr std::string_view kVariableIndexKey = "_mdio_variable_index";
+
 // ============================================================================
 // V3-Specific JSON Utilities
 // ============================================================================
@@ -198,6 +217,35 @@ inline std::vector<std::string> ExtractChildArrayCandidates(
     }
   }
   return candidates;
+}
+
+/**
+ * @brief Extracts the variable names from the variable specs.
+ *
+ * Every spec source (dataset_factory's `from_json_to_spec`, CommitMetadata's
+ * rebuilt specs, HeaderVariable's `ToCommitJson`) lays out `kvstore.path` as
+ * `<dataset path>/<variable name>` with no trailing slash, so the variable
+ * name is the last path component. Names are returned in spec order, deduped
+ * (the List-based discovery path dedupes too, keeping both discovery paths
+ * behaviorally identical).
+ *
+ * @param json_variables The variable JSON specs being written.
+ * @return Vector of unique variable names in declaration order.
+ */
+inline std::vector<std::string> ExtractVariableNames(
+    const std::vector<nlohmann::json>& json_variables) {
+  std::vector<std::string> names;
+  for (const auto& json : json_variables) {
+    const std::string path = json["kvstore"]["path"].get<std::string>();
+    std::vector<std::string> parts = absl::StrSplit(path, '/');
+    if (parts.empty() || parts.back().empty()) {
+      continue;
+    }
+    if (std::find(names.begin(), names.end(), parts.back()) == names.end()) {
+      names.push_back(parts.back());
+    }
+  }
+  return names;
 }
 
 // ============================================================================
@@ -405,9 +453,18 @@ inline Future<void> WriteMetadata(
 
   auto kvs_future = tensorstore::kvstore::Open(kvstore, context);
 
-  // Create root metadata (variables are discovered via directory listing,
-  // not stored in zarr.json)
+  // Create root metadata with the variable index (see kVariableIndexKey for
+  // the site decision). The index lets the open path skip the full-store
+  // kvstore List, which on NFS costs one openat per file in the store; it is
+  // regenerated on every write (create and CommitMetadata both pass the full
+  // variable set through here), so mdio workflows keep it current. Stores
+  // mutated by non-mdio tooling must update or remove the index, or the
+  // changes stay invisible to index-based opens.
   auto root_metadata = CreateGroupMetadata(dataset_metadata);
+  auto variable_names = ExtractVariableNames(json_variables);
+  if (!variable_names.empty()) {
+    root_metadata["attributes"][kVariableIndexKey] = variable_names;
+  }
 
   auto root_future = tensorstore::MapFutureValue(
       tensorstore::InlineExecutor{},
