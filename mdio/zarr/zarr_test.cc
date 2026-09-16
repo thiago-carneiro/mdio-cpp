@@ -993,6 +993,81 @@ TEST(ZarrV3, BuildVariableSpec_S3) {
   EXPECT_EQ(spec["kvstore"]["path"], "nested/path/amplitude");
 }
 
+// =============================================================================
+// V3 Variable Index Tests
+// =============================================================================
+
+TEST(ZarrV3, ExtractVariableNames_FromSpecPaths) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/inline"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/crossline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic", "inline", "crossline"));
+}
+
+TEST(ZarrV3, ExtractVariableNames_Deduplicates) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic"));
+}
+
+TEST(ZarrV3, ExtractVariableNames_TrailingSlashSkipped) {
+  // A path ending in '/' has no variable name as its last component; such a
+  // spec cannot be indexed and is skipped.
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic/"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/inline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("inline"));
+}
+
+TEST(ZarrV3, WriteMetadata_WritesVariableIndexToRoot) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_write_" + std::to_string(std::rand()));
+  std::filesystem::create_directories(tmpDir);
+
+  nlohmann::json dataset_metadata = {{"name", "index_test"}};
+  std::vector<nlohmann::json> json_variables = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": ")" +
+                            tmpDir.string() + R"(/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": ")" +
+                            tmpDir.string() + R"(/inline"}})"),
+  };
+
+  auto write = mdio::zarr::v3::WriteMetadata(dataset_metadata, json_variables);
+  ASSERT_TRUE(write.result().ok()) << write.result().status();
+
+  // The root zarr.json on disk carries the index alongside the user
+  // attributes, and remains a valid V3 group document.
+  std::ifstream root_file(tmpDir / "zarr.json");
+  ASSERT_TRUE(root_file.good());
+  auto root = nlohmann::json::parse(root_file);
+  EXPECT_EQ(root["zarr_format"], 3);
+  EXPECT_EQ(root["node_type"], "group");
+  EXPECT_EQ(root["attributes"]["name"], "index_test");
+  EXPECT_THAT(root["attributes"]["_mdio_variable_index"],
+              testing::ElementsAre("seismic", "inline"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
 }  // namespace ZarrV3Tests
 
 // =============================================================================
