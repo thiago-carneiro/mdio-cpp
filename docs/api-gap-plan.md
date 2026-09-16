@@ -312,11 +312,21 @@ Deliverables (the evaluation's recorded fix directions):
 
 1. **Direct chunk-key addressing** — construct chunk keys from the stored
    grid instead of directory listing (removes the `getdents64` walks).
+   *(Refuted at implementation, wave 1: chunk reads already address by
+   computed key — one full-path `openat` per chunk. The measured syscalls
+   come from a single recursive List of the whole store emitted by mdio
+   itself, `zarr_v3.h:580`, to discover variables — see the status note
+   below.)*
 2. **In-process metadata lookup cache** — positive and negative entries
    (a failed existence check must not re-hit the store).
+   *(Refuted at implementation, wave 1: the cost model is one process per
+   task — an in-process cache never gets a second hit.)*
 3. **Bulk region reads** — a multi-region API on M2's iterator substrate:
    one open-handle set, many boxes (M2's one-box-per-chunk must not become
    the default read pattern).
+   *(Re-scoped, wave 1: the measured bottleneck (the store List) is gone;
+   per-chunk open cost is ~25 ms per 16-chunk read. Re-evaluate whether a
+   bulk API still pays before building it — see M2.)*
 
 Performance gates (apply to every milestone that touches the I/O path —
 M2, M5, M6, M7): per-region latency, metadata-syscall count per read, and
@@ -330,6 +340,26 @@ removed; byte-identical outputs to the current workaround.
 
 Size: large; needs a benchmark harness first (the evaluation's probe
 programs are the starting point).
+
+*(Implemented, wave 1 — harness `8f45c52`; fix `067b3a5`+`e860b9c` — and
+the premise inverted a third time. Attribution (strace + tensorstore
+source, `.orquestra/pipeline/api-gap-plan-corrections-20260914/m7-attribution.md`):
+the entire measured cost was ONE recursive `kvstore::List` of the store,
+emitted by mdio's own v3 open path (`zarr_v3.h:580`) to discover
+variables — walking every directory and probing every file (the 6,137
+"failed existence probes" were the lister's file-or-directory test on
+every chunk file, not chunk-key probing). The fix: the create path
+writes a variable index to `attributes._mdio_variable_index` in the
+root `zarr.json` (free-form per the v3 spec — every reader tolerates
+it), and open skips the List when the index is present, falling back to
+List for foreign/older stores (behavioral test with a decoy variable
+proves both paths). Gates, node gr15sdes01, harness
+`mdio_nfs_metadata_bench`: many (6128 chunk files) 12.3 s → 0.029 s,
+openat 8100 → 40, getdents64 3849 → 0; few 0.310 s → 0.028 s; checksums
+identical in every arm; fallback arm unchanged (12.3 s / 8100 / 3849).
+The 383-task distributed acceptance re-run is downstream work
+(formato-dados) — the per-task proxy collapsed 424×, which exceeds the
+cost model's prediction for the full case.)*
 
 ## Small fixes (verified against `fcbfb85`)
 
