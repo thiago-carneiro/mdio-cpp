@@ -459,7 +459,7 @@ mdio_cc_test(
   SRCS
     zarr/zarr_test.cc
   COPTS
-    ${mdio_DEFAULT_COPTS} 
+    ${mdio_DEFAULT_COPTS}
   LINKOPTS
     ${mdio_DEFAULT_LINKOPTS}
   DEPS
@@ -476,4 +476,42 @@ mdio_cc_test(
     tensorstore::util_status_testutil
     nlohmann_json_schema_validator
 )
+
+# ============ Benchmarks ============
+#
+# Benchmark executables are NOT tests: they create datasets on the
+# filesystem path given as argv and are meant to run against an NFS
+# mount explicitly (the M7 metadata-path performance gates are
+# backend-specific; see docs/api-gap-plan.md, M7). Build them with
+# -DMDIO_BUILD_BENCHMARKS=ON.
+option(MDIO_BUILD_BENCHMARKS
+  "Build mdio benchmark executables (NFS metadata-path harness etc.)"
+  OFF)
+
+if(MDIO_BUILD_BENCHMARKS)
+  add_executable(mdio_nfs_metadata_bench
+    benchmark/nfs_metadata_bench.cpp
+  )
+  target_include_directories(mdio_nfs_metadata_bench
+    PUBLIC ${mdio_COMMON_INCLUDE_DIRS}
+  )
+  target_compile_options(mdio_nfs_metadata_bench
+    PRIVATE ${mdio_DEFAULT_COPTS}
+  )
+  target_link_libraries(mdio_nfs_metadata_bench
+    PUBLIC
+      tensorstore::driver_array
+      tensorstore::driver_zarr
+      tensorstore::driver_zarr3
+      tensorstore::driver_json
+      tensorstore::kvstore_file
+      tensorstore::stack
+      tensorstore::tensorstore
+      tensorstore::index_space_dim_expression
+      tensorstore::index_space_index_transform
+      nlohmann_json_schema_validator
+  )
+  # mdio libraries require C++17 as the current minimum standard.
+  target_compile_features(mdio_nfs_metadata_bench PUBLIC cxx_std_17)
+endif()
 
