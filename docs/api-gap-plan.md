@@ -20,7 +20,7 @@ interop must match it wherever possible).
 |---|---|---|---|---|
 | 1 | No serialization round-trip (`to_json`) | `to_mdio(open_mdio(...))` | ~700 lines (hand-built creation JSON) | M1 |
 | 2 | No chunk iteration | xarray/dask lazy chunks | triple nested loops in every reader | M2 |
-| 3 | `sel`: `ListDescriptor` blocked; range endpoints require exact value match | `dataset.sel(inline=slice(a, b))` | full coordinate reads + manual index math | M3 |
+| 3 | `sel`: range endpoints require exact value match (nearest-value selection absent) | `dataset.sel(inline=slice(a, b))` | full coordinate reads + manual index math | M3 |
 | 4 | No statistics computation | `statsV1` on ingest | manual accumulators per trace/slice | M4 |
 | 5 | No dtype-erased transfer | dtype-generic xarray ops | hand-rolled dtype dispatch tables | M5 |
 | 6 | No execution layer | dask schedulers | external orchestration (kept, for now) | M6 |
@@ -118,35 +118,74 @@ rejected; domains with offset (post-`isel` — see fix 4).
 Acceptance: downstream trace reader ≤120 lines (from 358) with no manual
 chunk loops, byte-identical output to the current workaround.
 
-## M3 — Value-based selection: `Dataset::sel()`
+## M3 — Value-based selection: complete `Dataset::sel()`
 
-`CoordinateSelector::query()` returns `UnimplementedError` for
-`RangeDescriptor`/`ListDescriptor` (coordinate_selector.h). Downstream code
-reads entire coordinate variables to compute extents and converts values to
-indices by hand.
+`Dataset::sel(Descriptors...)` already exists (dataset.h:618-867) and
+already implements selection by coordinate VALUE for all three descriptor
+kinds — `ValueDescriptor` (dataset.h:704-734), `ListDescriptor`
+(dataset.h:735-765), and `RangeDescriptor` with value→index conversion
+(dataset.h:766-864) — with tests (dataset_test.cc:678-919; the full
+`Dataset.sel*` suite passes at `fcbfb85`, `selList` included).
+
+One gap remains, plus one cleanup:
+
+1. Range endpoints require an exact value match ("Start value not found",
+   dataset.h:819-821); mdio-python `sel(inline=slice(a, b))` selects the
+   nearest contained values instead.
+2. Cleanup: the `ListDescriptor` guard in `sel`'s validation lambda
+   (dataset.h:655-683; `UnimplementedError` at :661-662) is dead code —
+   the validation loop iterates an `initializer_list`, whose elements are
+   const-qualified, so `outer_type<decltype(descriptor)>::type` is
+   `const ListDescriptor<T>` and the guard's `if constexpr` never fires
+   (compile-time verified: the error string is absent from the test
+   binary). The `SliceDescriptor` deprecation check in the same lambda
+   dies the same way. Delete the dead checks — as written, the guard
+   misleads readers into believing List selection is unsupported.
+
+(The `CoordinateSelector` layer — `UnimplementedError` in `_applyOp`,
+coordinate_selector.h:255-257, reachable via `ReadDataVariables` — is a
+separate, parallel selection path with overlapping responsibilities. This
+milestone works in `Dataset::sel`; consolidating the two layers is a
+follow-up decision, not part of M3.)
 
 ```cpp
-// mdio/dataset.h
-/// Selection by coordinate VALUE (not index). Mirrors mdio-python sel().
-Result<Dataset> Dataset::sel(std::variant<RangeDescriptor<Index>,
-                                           ListDescriptor<Index>>... descs);
+// No new overload. The existing template stays the only sel():
+//   template <typename... Descriptors>
+//   Result<Dataset> Dataset::sel(Descriptors... descs);  // dataset.h:618
+// Work items, in the existing method:
+//   - nearest-value endpoint matching for RangeDescriptor;
+//   - delete the dead ListDescriptor/SliceDescriptor checks
+//     (dataset.h:661-671);
+//   - descriptors stay VALUE-typed (RangeDescriptor<T> with T = the
+//     coordinate dtype — the trait extract_descriptor_Ttype,
+//     variable.h:175-193, already exists); Index-typed descriptors
+//     remain isel's domain.
 ```
 
 Design notes:
 
-- Implement `CoordinateSelector::query` for Range/List: read the 1-D
-  coordinate variable, validate monotonicity, binary-search value → index,
-  delegate to `isel`.
-- Document the value-vs-index distinction explicitly (see "Domain origin
-  semantics").
+- Value→index lookup consolidates in the existing `descriptor_to_index`
+  (dataset.h:532-608): add binary search there (coordinates are validated
+  monotonic) instead of a third copy of the logic.
+- The current implementation reads the full 1-D coordinate variable
+  (`var.Read()`, dataset.h:549/790). Keep that for now — chunked or binary
+  search over the coordinate is an optimization to revisit with M7's bulk
+  reads.
+- Endpoint semantics follow mdio-python: nearest contained value; error
+  (not clamp) for values entirely outside the range; descending
+  coordinates: match mdio-python behavior (verify against xarray `.sel`
+  semantics when implementing — do not decide ad hoc in the test).
 
-Tests: monotonic coords; half-open value ranges; values outside the range
-(error, not clamp); descending coords (reject or support — decide).
+Tests: nearest-value endpoints (both ends); values entirely outside the
+range (error, not clamp); descending coordinates (per mdio-python); the
+existing `Dataset.sel*` suite keeps passing unchanged — it is the
+regression net for the dead-guard removal.
 
-Acceptance: downstream ROI selection program ≤80 lines (from 246), no full
-coordinate reads.
+Acceptance: `sel(inline=slice(a, b))` matches mdio-python's selection on
+the same store; the existing `Dataset.sel*` suite passes with the dead
+checks removed.
 
-Size: ~3–5 days.
+Size: ~2–4 days (the selection machinery already exists and is tested).
 
 ## M4 — Statistics: `statsV1` computation
 
