@@ -58,12 +58,25 @@ Design notes:
   and `CommitMetadata` already serializes them via `ToCommitJson()`
   (dataset.h:1331-1333) — `to_json()` must use the same path, or the
   round-trip guarantee fails silently for datasets with header variables.
+  *(Corrected at implementation, wave 1: `from_json()`/`Construct()`
+  rejects header-variable entries — the creation schema has no
+  representation for them (`additionalProperties: false`). Full
+  preservation is prerequisite-gated on creation-side header-variable
+  support; until then `to_json()` fails LOUDLY (InvalidArgumentError
+  naming the prerequisite) for datasets with header variables — the
+  no-silent-failure intent holds.)*
 - Struct-array round-trip has explicit prerequisites outside this plan:
   the spec derivation for structured variables currently yields `"byte"`
   (rejected by the creation schema — companion evaluation, Issue 02), and
   the write-dialect mismatch `"struct"` vs `"structured"` (zarr-python
   #2134, Issue 01) must land first. Until then the struct-array round-trip
   test is prerequisite-gated, not expected to pass.
+  *(Corrected at implementation, wave 1: the gate premise was refuted —
+  `to_json()` derives `dataType` from the zarr dtype metadata, not the
+  top-level spec, and the struct-array round-trip PASSES on V2 and V3
+  with field-level equality, covered by `toJsonRoundTrip`. The remaining
+  struct limitation is cross-tool (zarr-python write dialect, Issue 01) —
+  not mdio-cpp round-trip.)*
 - Output must validate against `dataset_schema.h` and open in mdio-python.
 - No heuristics: the library has the real metadata; the downstream prototype
   guessed because it did not.
