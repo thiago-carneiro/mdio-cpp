@@ -1207,6 +1207,10 @@ class Variable : public VariableBase {
    * @param desc The slice descriptor to be clamped
    * @return A slice descriptor that will not go out-of-bounds for the given
    * Variable.
+   * @note A sliced Variable's domain carries an offset: slicing a `[0, 383)`
+   * domain with descriptor `{83, 383}` yields domain `[83, 383)` (origin 83,
+   * shape 300). The clamp must therefore compare against `origin + shape` as
+   * the exclusive upper bound, not `shape` alone.
    */
   RangeDescriptor<Index> sliceInRange(
       const RangeDescriptor<Index>& desc) const {
@@ -1288,6 +1292,10 @@ class Variable : public VariableBase {
    * @post The resulting Variable will be sliced along the specified dimensions
    * within it's domain. If the slice lay outside of the domain of the Variable,
    * the slice will be clamped to the domain.
+   * @note Descriptor start/stop are domain indices, not coordinate values.
+   * A freshly opened variable's domain is 0-based `[0, shape)` (zarr has no
+   * origin concept); a sliced variable's domain carries an offset. To select
+   * by coordinate value, use `Dataset::sel`.
    * @param descriptors The descriptors used to specify the slice.
    * @details \b Usage
    * This provides an example of slicing the Variable along the inline and
