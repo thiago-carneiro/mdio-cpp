@@ -248,6 +248,40 @@ inline std::vector<std::string> ExtractVariableNames(
   return names;
 }
 
+/**
+ * @brief Extracts the variable index from a root zarr.json.
+ *
+ * Returns the indexed variable names, or an empty vector when the store has
+ * no usable index (key absent, not an array, empty, or any non-string entry)
+ * -- the caller then falls back to listing the store, which is the behavior
+ * for mdio-python, foreign, and pre-index mdio-cpp stores.
+ *
+ * @param root_json The parsed root zarr.json content.
+ * @return Vector of indexed variable names; empty when absent or malformed.
+ */
+inline std::vector<std::string> ExtractVariableIndex(
+    const nlohmann::json& root_json) {
+  std::vector<std::string> names;
+  if (!root_json.contains("attributes")) {
+    return names;
+  }
+  const auto& attributes = root_json["attributes"];
+  if (!attributes.is_object() || !attributes.contains(kVariableIndexKey)) {
+    return names;
+  }
+  const auto& index = attributes[kVariableIndexKey];
+  if (!index.is_array() || index.empty()) {
+    return names;
+  }
+  for (const auto& name : index) {
+    if (!name.is_string()) {
+      return {};
+    }
+    names.push_back(name.get<std::string>());
+  }
+  return names;
+}
+
 // ============================================================================
 // Dtype Conversion
 // ============================================================================
@@ -585,21 +619,10 @@ inline void OnV3ChildReadsComplete(std::shared_ptr<V3MetadataState> state,
 }
 
 /// Step 3: Read all child zarr.json files and filter by node_type.
-inline void OnV3ListComplete(
-    std::shared_ptr<V3MetadataState> state,
-    tensorstore::ReadyFuture<std::vector<tensorstore::kvstore::ListEntry>>
-        list_ready) {
-  if (!list_ready.result().ok()) {
-    state->Fail(list_ready.result().status());
-    return;
-  }
-
-  state->candidates = ExtractChildArrayCandidates(list_ready.value());
-  if (state->candidates.empty()) {
-    state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
-    return;
-  }
-
+///
+/// Shared by the index path (candidates from the root variable index) and
+/// the List path (candidates from ExtractChildArrayCandidates).
+inline void ReadChildMetadata(std::shared_ptr<V3MetadataState> state) {
   // Read all child zarr.json files
   state->read_futures =
       std::make_shared<std::vector<V3MetadataState::ReadFuture>>();
@@ -617,7 +640,26 @@ inline void OnV3ListComplete(
   });
 }
 
-/// Step 2: Parse root metadata and list kvstore contents.
+/// Step 3 (List path): extract candidates from the list result and read them.
+inline void OnV3ListComplete(
+    std::shared_ptr<V3MetadataState> state,
+    tensorstore::ReadyFuture<std::vector<tensorstore::kvstore::ListEntry>>
+        list_ready) {
+  if (!list_ready.result().ok()) {
+    state->Fail(list_ready.result().status());
+    return;
+  }
+
+  state->candidates = ExtractChildArrayCandidates(list_ready.value());
+  if (state->candidates.empty()) {
+    state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
+    return;
+  }
+
+  ReadChildMetadata(state);
+}
+
+/// Step 2: Parse root metadata and discover variables (index or List).
 inline void OnV3RootReadComplete(
     std::shared_ptr<V3MetadataState> state,
     tensorstore::ReadyFuture<tensorstore::kvstore::ReadResult> root_ready) {
@@ -633,7 +675,23 @@ inline void OnV3RootReadComplete(
   }
 
   state->dataset_metadata = GetJsonObject(root_json.value(), "attributes");
+  // The variable index is internal bookkeeping, not user metadata; remove it
+  // from the dataset metadata handed to the caller (GetJsonObject returns a
+  // copy, so this never touches the stored zarr.json).
+  state->dataset_metadata.erase(kVariableIndexKey);
 
+  // mdio-written stores carry the variable index in the root attributes: use
+  // it and skip the full-store List entirely (one openat per file in the
+  // store on NFS). The index is authoritative for mdio-written stores.
+  auto variable_index = ExtractVariableIndex(root_json.value());
+  if (!variable_index.empty()) {
+    state->candidates = std::move(variable_index);
+    ReadChildMetadata(state);
+    return;
+  }
+
+  // No index (mdio-python, foreign, or pre-index mdio-cpp stores): discover
+  // variables by listing the store, as before.
   auto list_future = tensorstore::kvstore::ListFuture(state->kvs);
   list_future.ExecuteWhenReady(
       [state](
@@ -664,9 +722,11 @@ inline void OnV3KvStoreReady(
 /**
  * @brief Reads dataset metadata from Zarr V3 format (non-consolidated).
  *
- * For Zarr V3, we read the root zarr.json and then discover arrays
- * by listing the kvstore contents and checking each zarr.json for
- * node_type="array" (skipping groups).
+ * For Zarr V3, we read the root zarr.json and then discover arrays either
+ * from the variable index in the root attributes (mdio-written stores; skips
+ * the store List) or, when no index is present, by listing the kvstore
+ * contents and checking each zarr.json for node_type="array" (skipping
+ * groups).
  *
  * @param dataset_path The path to the dataset.
  * @param kvs_future A future to the KvStore.
