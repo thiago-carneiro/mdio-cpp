@@ -91,6 +91,20 @@ output to the current workaround; the downstream `variable_spec_builder`
 
 Size: ~300–400 lines + tests. Strongest single PR candidate.
 
+*(Implemented, wave 1 — library `1bdbc00` + un-gate `9818db5`; downstream
+acceptance on formato-dados `feature/m1-tojson-copy`
+(`4f221d3`/`2b0cce7`/`b9aeedd`): byte-identical to the current workaround,
+136/136 files sha256-equal (createdOn included — both paths pass the
+source's through); the hand-rolled spec builder is deleted (141 lines, not
+the ~460 estimated — the estimate counted a different artifact);
+`CopyDataset` is 50 lines (≤60 target). Known limitation, discovered at
+acceptance: raw zarr v3 codecs (`codecs:[bytes,zstd]`, as written by this
+fork's datasets) have no representation in the creation schema, which
+models blosc-only compressors — `to_json()` rejects them loudly (the old
+workaround silently dropped compression); schema extension is a
+cross-project follow-up (the creation schema is shared with mdio-python's
+MDIO v1 schema).)*
+
 ## M2 — Chunk iteration: `Variable::chunks()`
 
 Every downstream reader hand-rolls the same triple loop with edge clamping.
