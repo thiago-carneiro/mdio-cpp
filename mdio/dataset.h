@@ -448,6 +448,9 @@ class Dataset {
    * );
    * @endcode
    *
+   * @note The descriptor start/stop are domain indices, not coordinate
+   * values. To select by coordinate value, use `sel`.
+   *
    * @return An `mdio::Result` containing a sliced Dataset if successful, or an
    * error if the slice is invalid.
    */
@@ -666,6 +669,8 @@ class Dataset {
    * descriptors provided.
    * @param descriptors The descriptors to use for the slice. May be
    * `RangeDescriptor`, `ValueDescriptor`, or `ListDescriptor`.
+   * @note Descriptor values are coordinate values, not domain indices; use
+   * `isel` to select by domain index.
    */
   template <typename... Descriptors>
   Result<Dataset> sel(Descriptors... descriptors) {
