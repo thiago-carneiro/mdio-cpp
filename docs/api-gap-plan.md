@@ -293,6 +293,24 @@ edges; merge of partials equals single-pass computation.
 Acceptance: downstream il/xl reader ≤150 lines (from 532); statsV1 written
 by C++ reads back in mdio-python.
 
+*(Downstream acceptance, wave 4 — formato-dados `383de68`+`d49ae61` on
+`feature/m1-tojson-copy`: the local stats accumulator deleted (367 lines);
+`trace_reader_il_xl` publishes statsV1 via `ComputeStats(seismic,
+binCenters)` with explicit 20-bin centers (`UniformBinCenters`) — the
+library default (10 bins) would change the committed histogram. Verified
+against an old side rebuilt from the same library: stdout byte-identical;
+committed statsV1 identical in every field except ONE sample of 29.8M
+moving across two adjacent histogram bins — the old accumulator placed
+the bin edge in double, the library in midpoint float32 (Δ < ½ ulp), a
+documented library semantic, not a bug. Acceptance number honestly
+missed: trace_reader_il_xl 242 → 261 lines, not ≤150 — `ComputeStats` is
+whole-variable only (no per-axis/slice reduction), and ~90 lines of
+manual per-slice reduction are pinned by the program's stdout contract
+(same pattern as M2's ≤120 finding); a per-axis reduction API is the
+follow-up that would unlock it. Doc follow-up executed: the stats.h
+publishing example now carries the measured nesting caveat and the
+narrow form.)*
+
 Size: ~1 week.
 
 *(Implemented, wave 4 — `f6cfa7c`. Parity verified against mdio-python

@@ -838,7 +838,13 @@ struct Variable;
  * MDIO_RETURN_IF_ERROR(dataset.CommitMetadata().status());
  * @endcode
  * `UpdateAttributes` replaces the whole UserAttributes, so start from
- * `GetAttributes()` to preserve any existing attributes/units.
+ * `GetAttributes()` to preserve any existing attributes/units. Caveat
+ * (measured downstream, api-gap-plan M4 acceptance): for some store
+ * layouts this round-trip nests the attributes key one level deeper per
+ * commit; for such layouts use the narrow form
+ * `UpdateAttributes({{"statsV1", stats.getBindable()}})` — it still
+ * replaces the whole UserAttributes, so include `unitsV1`/`attributes`
+ * alongside when they must survive.
  *
  * @param var The variable to compute statistics over.
  * @return The summary statistics, or an error for an unsupported dtype or a
