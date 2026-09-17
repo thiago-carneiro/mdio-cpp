@@ -1219,6 +1219,67 @@ TEST(ZarrV3, ReadMetadata_FallsBackToListWithoutIndex) {
   std::filesystem::remove_all(tmpDir);
 }
 
+// The variable index is authoritative for mdio-written stores: an indexed
+// variable whose metadata is missing fails the open naming the variable,
+// instead of silently opening an incomplete dataset.
+TEST(ZarrV3, ReadMetadata_IndexedVariableMissingFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_missing_" + std::to_string(std::rand()));
+  // The index lists "missing", but only "seismic" exists on disk.
+  WriteSyntheticV3Store(tmpDir, {"seismic", "missing"}, {"seismic"});
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("missing"));
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("missing/zarr.json"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+// Corrupt (unparseable) metadata for an indexed variable fails the open
+// the same way a missing one does.
+TEST(ZarrV3, ReadMetadata_IndexedVariableCorruptFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_corrupt_" + std::to_string(std::rand()));
+  WriteSyntheticV3Store(tmpDir, {"seismic", "corrupt"},
+                        {"seismic", "corrupt"});
+  {
+    std::ofstream corrupt_file(tmpDir / "corrupt" / "zarr.json");
+    corrupt_file << "{ not json";
+  }
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("corrupt"));
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("corrupt/zarr.json"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+// The index only ever lists variables (arrays); an indexed candidate that
+// turns out to be a group means the store diverges from its index, which
+// also fails the open. The List path keeps skipping groups leniently (see
+// ReadMetadata_FallsBackToListWithoutIndex).
+TEST(ZarrV3, ReadMetadata_IndexedNonArrayFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_group_" + std::to_string(std::rand()));
+  WriteSyntheticV3Store(tmpDir, {"seismic", "groupchild"},
+                        {"seismic", "groupchild"});
+  {
+    nlohmann::json group = {{"zarr_format", 3}, {"node_type", "group"}};
+    std::ofstream group_file(tmpDir / "groupchild" / "zarr.json");
+    group_file << group.dump(4);
+  }
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("groupchild"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
 TEST(ZarrV3, ReadMetadata_WriteThenOpenRoundTrip) {
   auto tmpDir = std::filesystem::temp_directory_path() /
                  ("zarr_v3_roundtrip_" + std::to_string(std::rand()));

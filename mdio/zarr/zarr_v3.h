@@ -566,6 +566,11 @@ struct V3MetadataState {
   KvStoreLocation location;
   std::vector<std::string> candidates;
   std::shared_ptr<std::vector<ReadFuture>> read_futures;
+  /// True when candidates came from the root variable index (mdio-written
+  /// stores) rather than a store List. On the index path every candidate
+  /// is a variable the writer committed to, so a candidate that does not
+  /// yield a variable spec fails the open instead of being skipped.
+  bool is_index_path = false;
 
   V3MetadataState(PromiseType p, KvStoreLocation loc)
       : promise(std::move(p)), location(std::move(loc)) {}
@@ -583,25 +588,66 @@ struct V3MetadataState {
     return BuildVariableSpec(std::string(kDriverName), location, var_name);
   }
 
+  /// Error for an indexed candidate that did not yield a variable spec.
+  /// Names the variable and its zarr.json path so the divergence between
+  /// the index and the store is actionable.
+  absl::Status IndexedVariableError(const std::string& var_name,
+                                    const std::string& reason) const {
+    return absl::InvalidArgumentError(
+        "Variable '" + var_name +
+        "' is listed in the variable index but its metadata " + reason +
+        ": " + location.path + var_name + "/zarr.json");
+  }
+
   /// Filters read results to build variable specs for arrays only.
-  std::vector<nlohmann::json> BuildVariableSpecs() const {
+  ///
+  /// On the List path, candidates are merely directories containing a
+  /// zarr.json: groups and unreadable children are legitimate store
+  /// contents and are skipped leniently. On the index path, candidates
+  /// are the variables the writer committed to (the index is
+  /// authoritative for mdio-written stores): a candidate whose metadata
+  /// cannot be read, parsed, or is not array metadata fails the open,
+  /// naming the variable, instead of silently dropping it.
+  Result<std::vector<nlohmann::json>> BuildVariableSpecs() const {
     std::vector<nlohmann::json> json_vars;
     for (size_t i = 0; i < candidates.size(); ++i) {
       const auto& result = (*read_futures)[i].result();
-      if (!result.ok() || !result->has_value()) continue;
+      if (!result.ok() || !result->has_value()) {
+        if (is_index_path) {
+          const std::string reason =
+              result.ok()
+                  ? "was not found"
+                  : "could not be read: " +
+                        std::string(result.status().message());
+          return IndexedVariableError(candidates[i], reason);
+        }
+        continue;
+      }
 
       auto parsed = ParseJsonFromReadResult(*result);
-      if (parsed.ok() && IsArrayMetadata(parsed.value())) {
-        if (parsed.value().contains("data_type") &&
-            IsMetadataOnlyDataType(parsed.value()["data_type"])) {
-          auto spec = MakeVariableSpec(candidates[i]);
-          spec["_mdio_header_only"] = true;
-          spec["_mdio_array_metadata"] = parsed.value();
-          json_vars.push_back(std::move(spec));
-          continue;
+      if (!parsed.ok()) {
+        if (is_index_path) {
+          return IndexedVariableError(
+              candidates[i],
+              "is not valid JSON: " + std::string(parsed.status().message()));
         }
-        json_vars.push_back(MakeVariableSpec(candidates[i]));
+        continue;
       }
+      if (!IsArrayMetadata(parsed.value())) {
+        if (is_index_path) {
+          return IndexedVariableError(candidates[i], "is not array metadata");
+        }
+        continue;
+      }
+      if (parsed.value().contains("data_type") &&
+          IsMetadataOnlyDataType(parsed.value()["data_type"])) {
+        auto spec = MakeVariableSpec(candidates[i]);
+        spec["_mdio_header_only"] = true;
+        spec["_mdio_array_metadata"] = parsed.value();
+        json_vars.push_back(std::move(spec));
+        continue;
+      }
+      json_vars.push_back(MakeVariableSpec(candidates[i]));
     }
     return json_vars;
   }
@@ -611,11 +657,15 @@ struct V3MetadataState {
 inline void OnV3ChildReadsComplete(std::shared_ptr<V3MetadataState> state,
                                    tensorstore::ReadyFuture<void>) {
   auto json_vars = state->BuildVariableSpecs();
-  if (json_vars.empty()) {
+  if (!json_vars.ok()) {
+    state->Fail(json_vars.status());
+    return;
+  }
+  if (json_vars->empty()) {
     state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
     return;
   }
-  state->Complete(std::move(json_vars));
+  state->Complete(std::move(*json_vars));
 }
 
 /// Step 3: Read all child zarr.json files and filter by node_type.
@@ -686,6 +736,7 @@ inline void OnV3RootReadComplete(
   auto variable_index = ExtractVariableIndex(root_json.value());
   if (!variable_index.empty()) {
     state->candidates = std::move(variable_index);
+    state->is_index_path = true;
     ReadChildMetadata(state);
     return;
   }
