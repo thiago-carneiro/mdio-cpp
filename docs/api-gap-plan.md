@@ -145,6 +145,23 @@ rejected; domains with offset (post-`isel` — see fix 4).
 Acceptance: downstream trace reader ≤120 lines (from 358) with no manual
 chunk loops, byte-identical output to the current workaround.
 
+*(Implemented, wave 2 — library `acf162d` (`chunks()`) + `ce12985`
+(`chunks(dims...)` dimension-subset overload, added after the downstream
+migration surfaced the missing draft capability); downstream
+`2356a0c`+`b99c3f0`+`9a9e690` on formato-dados `feature/m1-tojson-copy`:
+all four consumers migrated, the local chunk iterator deleted (348
+lines), every equivalence gate byte-identical (trace readers sha256-equal
+against an old side REBUILT from the same library — a cached old binary
+is not a valid baseline: library drift from `e860b9c`'s variable index
+masqueraded as a migration diff). Acceptance number honestly missed:
+trace_reader 190 → 187 lines, not ≤120 — the ≤120 estimate was
+calibrated against the 358-line baseline and ~75 lines of the current
+program are its fixed output contract; the acceptance INTENT (no manual
+chunk loops — and, after the overload, no manual box-skipping either) is
+met. Noted dependency: downstream progress/association logic relies on
+the row-major traversal order even though it is documented as NOT a
+contract.)*
+
 ## M3 — Value-based selection: complete `Dataset::sel()`
 
 `Dataset::sel(Descriptors...)` already exists (dataset.h:618-867) and
