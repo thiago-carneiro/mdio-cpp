@@ -357,6 +357,23 @@ Contract notes: the API is a pure per-element map — reversible iff `fn` is;
 no cross-element state. Decide after M1 lands how much of this is still
 needed.
 
+*(Decided and implemented, wave 5 — the residual need was real: the
+downstream dispatch tables and the ChunkTransform hook survived M1/M2/M4.
+Library `b746c3c` (`mdio/transform.h`): `ElementTransform` +
+`TransformVariable`, 13/13 tests, identity-fn == plain-copy proven
+byte-identical; structured dtypes transfer whole records; a failing `fn`
+aborts without submitting the write. Downstream `0d62a8f`+`89dae8e` on
+formato-dados: BOTH dtype dispatch tables (34 entries each),
+`TransferVariable<T>`/`TransferVariableRange<T>`, and the `ChunkTransform`
+hook collapsed into `TransformVariable` (−327 lines); trace_gain's
+dtype-spelling guard ("float32" vs "<f4") replaced by an element-size
+check. Byte-identical gates: pure copy 136/136 files, gain 136/136 (128
+seismic chunks gained), struct case fails IDENTICALLY on both sides (a
+pre-existing `chunks()` limitation on header variables, unchanged by this
+work). Library finding documented: a full-domain write on a struct FIELD
+view replaces the whole record — struct population must be a single
+void-view write; `TransformVariable` is immune.)*
+
 ## M6 — Execution layer (proposal stage)
 
 `MapChunks(variable, fn, ParallelOptions)` over TensorStore futures. Not
@@ -366,6 +383,12 @@ scheduled, it must specify region fusion/batching, open-handle reuse, and
 metadata caching — the evaluation measured the cost in per-task work
 (metadata round-trips), not in missing parallelism (K=8 did not degrade),
 so a chunk-level scheduler alone addresses the wrong bottleneck (see M7).
+
+*(Decision, wave 5 — stays unscheduled. The core gaps are now closed
+(M1–M5, M7), and the measured per-task cost was metadata round-trips —
+fixed in M7 via the variable index — not missing parallelism (K=8 did not
+degrade). Downstream keeps external orchestration (Parsl/Slurm).
+Re-evaluate only if a measured per-task cost reappears after M7.)*
 
 ## M7 — Metadata-path performance (measured bottleneck)
 
