@@ -1532,6 +1532,87 @@ class Variable : public VariableBase {
   }
 
   /**
+   * @brief Iterates over the chunk grid projected onto a subset of the
+   * variable's dimensions.
+   *
+   * Only the named dimensions are chunked: the grid iterates the chunk
+   * positions of the given dimensions, while every dimension left out of the
+   * subset is covered at its FULL domain extent. Each box spans one chunk
+   * position along each named dimension and the complete extent along all
+   * the others, in absolute domain indices, with partial edge chunks on the
+   * named dimensions — the same invariants as the full chunks() grid. The
+   * number of boxes is the product of the chunk counts along the named
+   * dimensions only.
+   *
+   * @details \b Usage
+   * @code
+   * // Spatial tiles, each covering the full time extent:
+   * MDIO_ASSIGN_OR_RETURN(auto spatial_chunks,
+   *                       velocity.chunks("inline", "crossline"));
+   * for (const auto& chunk : spatial_chunks) {
+   *   // chunk.shape()[2] == the full time extent.
+   * }
+   * @endcode
+   * @param dims The dimensions to chunk, each a label or a zero-based
+   * dimension index. The list must not be empty, every dimension must exist
+   * in the variable's domain, and no dimension may be named twice.
+   * @return An `mdio::Result` object containing the chunk range;
+   * InvalidArgumentError if the subset is empty, a dimension does not exist,
+   * or a dimension is named twice; the same errors as chunks() otherwise.
+   */
+  Result<ChunkRange> chunks(
+      const std::vector<DimensionIdentifier>& dims) const {
+    if (dims.empty()) {
+      return absl::InvalidArgumentError(
+          "Dimension subset must not be empty; call chunks() for the full "
+          "grid.");
+    }
+    auto domain = dimensions();
+    const std::size_t rank = domain.labels().size();
+    std::vector<Index> domain_origin(domain.origin().begin(),
+                                     domain.origin().end());
+    std::vector<Index> domain_shape(domain.shape().begin(),
+                                    domain.shape().end());
+    MDIO_ASSIGN_OR_RETURN(auto chunk_shape, get_chunk_shape());
+    if (chunk_shape.size() != rank) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Chunk grid requires one entry per dimension: got chunk shape rank ",
+          chunk_shape.size(), ", domain rank ", rank, "."));
+    }
+
+    // Dimensions left out of the subset are covered at full extent: seed the
+    // projected chunk shape with the domain shape (one chunk per dimension),
+    // then overwrite the named dimensions with the stored chunk size.
+    std::vector<Index> projected_chunk_shape = domain_shape;
+    std::vector<bool> named(rank, false);
+    for (const auto& dim : dims) {
+      MDIO_ASSIGN_OR_RETURN(auto position, ResolveDimensionPosition(dim));
+      if (named[position]) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("Dimension subset names dimension ", position,
+                         " of variable ", variableName, " more than once."));
+      }
+      named[position] = true;
+      projected_chunk_shape[position] = chunk_shape[position];
+    }
+    return ChunkRange::Create(std::move(domain_origin), std::move(domain_shape),
+                              std::move(projected_chunk_shape));
+  }
+
+  /**
+   * @brief Iterates over the chunk grid projected onto a subset of the
+   * variable's dimensions (variadic form).
+   * @param dims The dimensions to chunk, each a label or a zero-based
+   * dimension index; see the vector overload for the projection semantics.
+   * @return An `mdio::Result` object containing the chunk range; the same
+   * errors as the vector overload.
+   */
+  template <typename... DimensionIdentifier>
+  Result<ChunkRange> chunks(const DimensionIdentifier&... dims) const {
+    return chunks(std::vector<mdio::DimensionIdentifier>({dims...}));
+  }
+
+  /**
    * @brief Retrieves the entire shape of the Variable if it exists.
    * @return A NotFoundError if the shape could not be retrieved, otherwise a
    * vector of the shape.
@@ -1762,6 +1843,38 @@ class Variable : public VariableBase {
   }
 
  private:
+  /**
+   * @brief Resolves a dimension identifier to its zero-based domain position.
+   *
+   * Label-form identifiers are matched against the domain labels; index-form
+   * identifiers must fall inside the domain rank.
+   * @param dim The dimension identifier to resolve.
+   * @return An `mdio::Result` object containing the zero-based position, or
+   * InvalidArgumentError if the label does not exist in the domain or the
+   * index is out of range.
+   */
+  Result<std::size_t> ResolveDimensionPosition(
+      const DimensionIdentifier& dim) const {
+    const auto labels = store.domain().labels();
+    if (dim.label().data() != nullptr) {
+      for (std::size_t position = 0; position < labels.size(); ++position) {
+        if (labels[position] == dim) {
+          return position;
+        }
+      }
+      return absl::InvalidArgumentError(
+          absl::StrCat("Dimension \"", dim.label(),
+                       "\" does not exist in variable ", variableName, "."));
+    }
+    const auto index = dim.index();
+    if (index < 0 || static_cast<std::size_t>(index) >= labels.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Dimension index ", index, " is out of range for variable ",
+          variableName, " of rank ", labels.size(), "."));
+    }
+    return static_cast<std::size_t>(index);
+  }
+
   // delegate the I/O to the tensorstore
   tensorstore::TensorStore<T, R, M> store;
 };
