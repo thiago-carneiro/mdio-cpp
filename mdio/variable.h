@@ -2157,5 +2157,186 @@ Result<VariableData<T, R, OriginKind>> from_variable(
       variable.get_variable_name(), variable.get_long_name(),
       variable.getReducedMetadata(), std::move(labeled_array)};
 }
+
+namespace internal {
+
+/**
+ * @brief One accumulation pass over a flat, C-contiguous buffer.
+ *
+ * Accumulates the scalar stats and, when bin edges are supplied, the
+ * histogram counts. NaN values are skipped for floating point types.
+ * @tparam T The element type of the buffer.
+ * @param data Pointer to the first element of the buffer.
+ * @param numElements Number of elements in the buffer.
+ * @param binUpperEdges Midpoints between bin centers, or null to skip
+ * histogramming.
+ * @param scalars The scalar accumulator, or null to skip scalar accumulation.
+ * @param binCounts The per-bin counts to fill, or null to skip histogramming.
+ */
+template <typename T>
+void AccumulateStatsPass(const void* data, const std::size_t numElements,
+                         const std::vector<double>* binUpperEdges,
+                         StatsAccumulator* scalars,
+                         std::vector<int64_t>* binCounts) {
+  const T* values = static_cast<const T*>(data);
+  for (std::size_t index = 0; index < numElements; ++index) {
+    if constexpr (std::is_floating_point_v<T>) {
+      if (std::isnan(values[index])) {
+        continue;  // NaN is "missing", not a value.
+      }
+    }
+    const double value = static_cast<double>(values[index]);
+    if (scalars != nullptr) {
+      scalars->Add(value);
+    }
+    if (binUpperEdges != nullptr) {
+      ++(*binCounts)[BinIndexForValue(value, *binUpperEdges)];
+    }
+  }
+}
+
+/**
+ * @brief Runs AccumulateStatsPass with the buffer interpreted as the
+ * variable's dtype.
+ *
+ * @return OkStatus, or an error for dtypes ComputeStats does not support.
+ */
+inline absl::Status AccumulateStatsDispatch(
+    const void* data, const std::size_t numElements, const DataType dtype,
+    const std::vector<double>* binUpperEdges, StatsAccumulator* scalars,
+    std::vector<int64_t>* binCounts) {
+  if (dtype == constants::kFloat32) {
+    AccumulateStatsPass<dtypes::float32_t>(data, numElements, binUpperEdges,
+                                           scalars, binCounts);
+  } else if (dtype == constants::kFloat64) {
+    AccumulateStatsPass<dtypes::float64_t>(data, numElements, binUpperEdges,
+                                           scalars, binCounts);
+  } else if (dtype == constants::kInt8) {
+    AccumulateStatsPass<dtypes::int8_t>(data, numElements, binUpperEdges,
+                                        scalars, binCounts);
+  } else if (dtype == constants::kInt16) {
+    AccumulateStatsPass<dtypes::int16_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kInt32) {
+    AccumulateStatsPass<dtypes::int32_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kInt64) {
+    AccumulateStatsPass<dtypes::int64_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kUint8) {
+    AccumulateStatsPass<dtypes::uint8_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kUint16) {
+    AccumulateStatsPass<dtypes::uint16_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else if (dtype == constants::kUint32) {
+    AccumulateStatsPass<dtypes::uint32_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else if (dtype == constants::kUint64) {
+    AccumulateStatsPass<dtypes::uint64_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else {
+    return absl::InvalidArgumentError(
+        "ComputeStats does not support dtype '" +
+        std::string(dtype.name()) +
+        "'. Supported dtypes are float32, float64, and the signed/unsigned "
+        "integer types.");
+  }
+  return absl::OkStatus();
+}
+
+/**
+ * @brief Shared implementation of the two ComputeStats overloads.
+ *
+ * Reads the whole variable into memory (tensorstore::Read returns a
+ * C-contiguous array), accumulates the scalar stats, and histograms either
+ * in the same pass (explicit bin centers) or in a second pass (default bins
+ * derived from the data range).
+ */
+inline Result<SummaryStats> ComputeStatsImpl(
+    const Variable<>& var, absl::Span<const float> binCenters) {
+  MDIO_ASSIGN_OR_RETURN(auto array,
+                        tensorstore::Read(var.get_store()).result());
+  // tensorstore::Read allocates a fresh C-contiguous array, so a flat walk
+  // from the origin pointer covers every element.
+  const std::size_t numElements =
+      static_cast<std::size_t>(array.num_elements());
+  const void* data = array.byte_strided_origin_pointer().get();
+
+  StatsAccumulator scalars;
+  std::vector<int64_t> binCounts;
+
+  if (!binCenters.empty()) {
+    for (std::size_t index = 1; index < binCenters.size(); ++index) {
+      if (binCenters[index] <= binCenters[index - 1]) {
+        return absl::InvalidArgumentError(
+            "ComputeStats: bin centers must be strictly increasing.");
+      }
+    }
+    const std::vector<double> upperEdges = BinUpperEdges(binCenters);
+    binCounts.assign(binCenters.size(), 0);
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
+        data, numElements, var.dtype(), &upperEdges, &scalars, &binCounts));
+  } else {
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(data, numElements, var.dtype(),
+                                                 nullptr, &scalars, nullptr));
+  }
+
+  if (scalars.count == 0) {
+    // The canonical empty statsV1 (mdio-python convention).
+    return SummaryStats::Create(
+        0, 0.0F, 0.0F, 0.0F, 0.0F,
+        std::make_unique<CenteredBinHistogram<float>>(std::vector<float>(),
+                                                      std::vector<int32_t>()));
+  }
+
+  if (scalars.count >
+      static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    return absl::InvalidArgumentError(
+        "ComputeStats: count " + std::to_string(scalars.count) +
+        " exceeds the int32 statsV1 count field.");
+  }
+  MDIO_ASSIGN_OR_RETURN(const float sumValue,
+                        CheckedFloat(scalars.sum, "sum"));
+  MDIO_ASSIGN_OR_RETURN(const float sumSquaresValue,
+                        CheckedFloat(scalars.sumSquares, "sumSquares"));
+  MDIO_ASSIGN_OR_RETURN(const float minValue, CheckedFloat(scalars.min, "min"));
+  MDIO_ASSIGN_OR_RETURN(const float maxValue, CheckedFloat(scalars.max, "max"));
+
+  std::vector<float> centers(binCenters.begin(), binCenters.end());
+  if (centers.empty()) {
+    if (scalars.min == scalars.max) {
+      // A constant variable gets a single bin; equal-width bins over a zero
+      // range would all share the same center.
+      centers.push_back(minValue);
+    } else {
+      centers = UniformBinCenters(scalars.min, scalars.max,
+                                  kDefaultHistogramBinCount);
+    }
+    const std::vector<double> upperEdges = BinUpperEdges(centers);
+    binCounts.assign(centers.size(), 0);
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
+        data, numElements, var.dtype(), &upperEdges, nullptr, &binCounts));
+  }
+
+  // Per-bin counts cannot overflow int32: each is at most the total count.
+  const std::vector<int32_t> counts(binCounts.begin(), binCounts.end());
+  auto histogram = std::make_unique<CenteredBinHistogram<float>>(centers,
+                                                                 counts);
+  return SummaryStats::Create(static_cast<int32_t>(scalars.count), maxValue,
+                              minValue, sumValue, sumSquaresValue,
+                              std::move(histogram));
+}
+
+}  // namespace internal
+
+inline Result<internal::SummaryStats> ComputeStats(const Variable<>& var) {
+  return internal::ComputeStatsImpl(var, {});
+}
+
+inline Result<internal::SummaryStats> ComputeStats(
+    const Variable<>& var, absl::Span<const float> binCenters) {
+  return internal::ComputeStatsImpl(var, binCenters);
+}
 };  // namespace mdio
 #endif  // MDIO_VARIABLE_H_
