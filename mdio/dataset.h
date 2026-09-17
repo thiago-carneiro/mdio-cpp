@@ -1034,7 +1034,8 @@ class Dataset {
    * Resolves range endpoints against an unordered coordinate axis.
    * Unordered axes cannot snap to a nearest contained value, so both
    * endpoints must match a coordinate exactly, and each endpoint value
-   * must be unique on the axis.
+   * must be unique on the axis. A start endpoint resolving after the
+   * stop endpoint is not supported.
    * @param coords The coordinate values in index order.
    * @param descriptor The value-typed range descriptor.
    * @param out_endpoints Receives the {start, stop} indices into coords.
@@ -1065,6 +1066,11 @@ class Dataset {
     }
     if (!stop.first) {
       return absl::InvalidArgumentError("Stop value not found.");
+    }
+    if (start.second > stop.second) {
+      return absl::UnimplementedError(
+          "Start value happens after stop value. This is not a supported "
+          "case.");
     }
     out_endpoints = {start.second, stop.second};
     return absl::OkStatus();

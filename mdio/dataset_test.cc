@@ -1131,6 +1131,10 @@ TEST(Dataset, selRangeFlippedStartStop) {
 
   auto sliceRes = ds.sel(ilRange);
   ASSERT_FALSE(sliceRes.status().ok());
+  // The exact-endpoint path errors at the value level, like its monotonic
+  // sibling, instead of surfacing downstream as an index-level error.
+  EXPECT_THAT(sliceRes.status().message(),
+              testing::HasSubstr("Start value happens after stop value"));
 }
 
 TEST(Dataset, selRepeatedListSingleton) {
