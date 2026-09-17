@@ -1036,6 +1036,25 @@ TEST(ZarrV3, ExtractVariableNames_TrailingSlashSkipped) {
   EXPECT_THAT(names, testing::ElementsAre("inline"));
 }
 
+// Malformed specs (missing kvstore, missing/non-string path, non-object
+// spec) are skipped, not UB/throw: the index is best-effort at write time.
+TEST(ZarrV3, ExtractVariableNames_SkipsMalformedSpecs) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"not_a_kvstore": true})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": 42}})"),
+      nlohmann::json::parse(R"({"kvstore": "file"})"),
+      nlohmann::json::parse(R"("just a string")"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/inline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic", "inline"));
+}
+
 TEST(ZarrV3, ExtractVariableIndex_Valid) {
   auto root = nlohmann::json::parse(R"({
       "zarr_format": 3,
