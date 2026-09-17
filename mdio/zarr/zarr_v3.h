@@ -229,6 +229,11 @@ inline std::vector<std::string> ExtractChildArrayCandidates(
  * (the List-based discovery path dedupes too, keeping both discovery paths
  * behaviorally identical).
  *
+ * Specs without a well-formed `kvstore.path` (missing or non-string) are
+ * skipped: the index is best-effort at write time, and the authoritative
+ * open path reports indexed variables that cannot be read (see
+ * V3MetadataState::BuildVariableSpecs).
+ *
  * @param json_variables The variable JSON specs being written.
  * @return Vector of unique variable names in declaration order.
  */
@@ -236,6 +241,11 @@ inline std::vector<std::string> ExtractVariableNames(
     const std::vector<nlohmann::json>& json_variables) {
   std::vector<std::string> names;
   for (const auto& json : json_variables) {
+    if (!json.contains("kvstore") ||
+        !json["kvstore"].contains("path") ||
+        !json["kvstore"]["path"].is_string()) {
+      continue;
+    }
     const std::string path = json["kvstore"]["path"].get<std::string>();
     std::vector<std::string> parts = absl::StrSplit(path, '/');
     if (parts.empty() || parts.back().empty()) {
