@@ -231,6 +231,22 @@ checks removed.
 
 Size: ~2–4 days (the selection machinery already exists and is tested).
 
+*(Implemented, wave 3 — `8e4958c` (nearest-value endpoints + binary-search
+consolidation in `descriptor_to_index`) + `854e827` (dead-guard removal).
+Parity verified against mdio-python 1.0.8 on the SAME store: 8/8 shared
+cases identical; the 5 documented divergences are this plan's own
+decisions (error instead of empty selection for out-of-range/flipped
+ranges). A fourth premise refuted at implementation: "coordinates are
+validated monotonic" — no such validation exists, and the suite's own
+test store is non-monotonic with tests depending on it. Resolution:
+monotonicity detected at runtime; binary search only on monotonic axes;
+non-ordered axes keep exact+unique bounds (also mdio-python's behavior
+in the suite-covered cases). Correlated adjustment: `start >= stop`
+became `start > stop` — endpoints collapsing to the same index now yield
+a 1-sample selection, as in xarray. Known non-ported divergence: the
+pandas internal artifact where a contiguous duplicated stop selects the
+last occurrence.)*
+
 ## M4 — Statistics: `statsV1` computation
 
 The serialization target already exists (`dataset_schema.h` defines
