@@ -16,12 +16,16 @@
 #define MDIO_STATS_H_
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "mdio/impl.h"
 #include "tensorstore/tensorstore.h"
 
@@ -66,10 +70,14 @@
  * dataset.variables.get("variable").value().userAttrs = updatedUserAttrs;
  * @endcode
  *
- * Another thing to note is that we do not supply an easy way to add a histogram
- * or attributes to an existing UserAttributes object. This is by design, a
- * defined Variable should know beforehand that it will contain those
- * attributes.
+ * Another thing to note is that we historically did not supply an easy way to
+ * add a histogram or attributes to an existing UserAttributes object. That
+ * policy was deliberately reverted by the statsV1 computation milestone of the
+ * API gap plan (see docs/api-gap-plan.md, "M4 — Statistics"): the intended
+ * path is now `mdio::ComputeStats` to compute a statsV1 (histogram included),
+ * merged into the variable's current attribute JSON, and published through the
+ * existing `VariableBase::UpdateAttributes` + `Dataset::CommitMetadata` flow.
+ * See `mdio::ComputeStats` for the full publishing example.
  */
 
 namespace mdio {
@@ -236,6 +244,45 @@ class SummaryStats {
         sumSquares(other.sumSquares),
         histogram(other.histogram->clone()) {}
 
+  /**
+   * @brief Constructs a SummaryStats from computed values.
+   * This is the construction path for freshly computed statistics (e.g.
+   * `mdio::ComputeStats` and `mdio::MergeStats`); parsing persisted statsV1
+   * JSON goes through `FromJson` instead.
+   * @param count The number of data points.
+   * @param max The largest value in the variable.
+   * @param min The smallest value in the variable.
+   * @param sum The total of all data values.
+   * @param sumSquares The total of all data values squared.
+   * @param histogram The binned frequency distribution. Must not be null.
+   * @return A SummaryStats, or an error if the histogram is null.
+   */
+  static mdio::Result<SummaryStats> Create(
+      const int32_t count, const float max, const float min, const float sum,
+      const float sumSquares, std::unique_ptr<const Histogram> histogram) {
+    if (histogram == nullptr) {
+      return absl::InvalidArgumentError(
+          "SummaryStats requires a histogram (may be empty, but not null).");
+    }
+    return mdio::Result<SummaryStats>(SummaryStats(
+        count, max, min, sum, sumSquares, std::move(histogram)));
+  }
+
+  /// @brief The number of data points.
+  int32_t get_count() const { return count; }
+  /// @brief The largest value in the variable.
+  float get_max() const { return max; }
+  /// @brief The smallest value in the variable.
+  float get_min() const { return min; }
+  /// @brief The total of all data values.
+  float get_sum() const { return sum; }
+  /// @brief The total of all data values squared.
+  float get_sum_squares() const { return sumSquares; }
+  /// @brief The binned frequency distribution.
+  const std::unique_ptr<const Histogram>& get_histogram() const {
+    return histogram;
+  }
+
   const nlohmann::json getBindable() const {
     nlohmann::json stats = this->histogram->getHistogram();
     stats["count"] = this->count;
@@ -333,6 +380,118 @@ class SummaryStats {
   const float sumSquares;
   const std::unique_ptr<const Histogram> histogram;
 };
+
+/**
+ * @brief Incremental accumulator for the scalar fields of a statsV1.
+ *
+ * Accumulates in double precision regardless of the variable's dtype so the
+ * per-partial float32 rounding happens exactly once, at the end. Shared by
+ * the ComputeStats dtype dispatch paths.
+ */
+struct StatsAccumulator {
+  int64_t count = 0;
+  double sum = 0.0;
+  double sumSquares = 0.0;
+  double min = 0.0;
+  double max = 0.0;
+
+  void Add(const double value) {
+    if (count == 0) {
+      min = value;
+      max = value;
+    } else {
+      min = std::min(min, value);
+      max = std::max(max, value);
+    }
+    sum += value;
+    sumSquares += value * value;
+    ++count;
+  }
+};
+
+/**
+ * @brief Converts a double accumulator to the float32 statsV1 field type.
+ *
+ * The statsV1 schema stores float32 fields; a non-finite or out-of-range
+ * value would serialize as null (invalid JSON for the schema), so it is
+ * rejected here instead of being corrupted at persistence time.
+ * @param value The accumulated value.
+ * @param field The statsV1 field name, used in the error message.
+ * @return The float32 value, or an error if it is not representable.
+ */
+inline mdio::Result<float> CheckedFloat(const double value,
+                                        const std::string& field) {
+  if (!std::isfinite(value) ||
+      std::fabs(value) >
+          static_cast<double>(std::numeric_limits<float>::max())) {
+    return absl::InvalidArgumentError(
+        "statsV1 field '" + field +
+        "' is not representable in the float32 range required by the "
+        "schema: " +
+        std::to_string(value));
+  }
+  return static_cast<float>(value);
+}
+
+/// The number of histogram bins ComputeStats derives from the data when the
+/// caller does not supply explicit bin centers.
+inline constexpr std::size_t kDefaultHistogramBinCount = 10;
+
+/**
+ * @brief Bin centers for `binCount` equal-width bins spanning
+ * [minValue, maxValue].
+ * @pre minValue < maxValue (a constant variable is binned into a single bin
+ * by the caller instead).
+ */
+inline std::vector<float> UniformBinCenters(const double minValue,
+                                            const double maxValue,
+                                            const std::size_t binCount) {
+  std::vector<float> centers;
+  centers.reserve(binCount);
+  const double width = (maxValue - minValue) / static_cast<double>(binCount);
+  for (std::size_t index = 0; index < binCount; ++index) {
+    centers.push_back(static_cast<float>(
+        minValue + (static_cast<double>(index) + 0.5) * width));
+  }
+  return centers;
+}
+
+/**
+ * @brief Upper edges (midpoints between adjacent bin centers) used for bin
+ * assignment.
+ *
+ * With equal-width bins these midpoints are the bin edges, so a value exactly
+ * on a midpoint belongs to the higher bin — matching half-open
+ * [edge, next_edge) bins over the data range.
+ */
+inline std::vector<double> BinUpperEdges(
+    const absl::Span<const float> centers) {
+  std::vector<double> edges;
+  if (centers.size() < 2) {
+    return edges;  // A single bin holds every value.
+  }
+  edges.reserve(centers.size() - 1);
+  for (std::size_t index = 0; index + 1 < centers.size(); ++index) {
+    edges.push_back((static_cast<double>(centers[index]) +
+                     static_cast<double>(centers[index + 1])) /
+                    2.0);
+  }
+  return edges;
+}
+
+/**
+ * @brief Index of the bin a value belongs to, given BinUpperEdges output.
+ *
+ * Values below the first edge land in bin 0, values at or above the last edge
+ * land in the last bin, and a value exactly on an edge goes to the higher
+ * bin.
+ */
+inline std::size_t BinIndexForValue(const double value,
+                                    const std::vector<double>& upperEdges) {
+  const auto edge =
+      std::upper_bound(upperEdges.begin(), upperEdges.end(), value);
+  return static_cast<std::size_t>(edge - upperEdges.begin());
+}
 
 }  // namespace internal
 
@@ -647,6 +806,262 @@ class UserAttributes {
   std::vector<std::string> units;
   const nlohmann::json attrs;
 };
+
+// Variable is defined in variable.h, which includes this header; it can only
+// be forward declared here, so the ComputeStats declarations spell out the
+// dtype-erased Variable<void, dynamic_rank, ReadWriteMode::dynamic> instead
+// of using its default template arguments.
+template <typename T, DimensionIndex R, ReadWriteMode M>
+struct Variable;
+
+/**
+ * @brief Computes the statsV1 summary statistics of a variable.
+ *
+ * Reads the whole variable and produces the on-disk statsV1 contract: an
+ * int32 count, float32 sum/sumSquares/min/max, and a CenteredBinHistogram
+ * with `internal::kDefaultHistogramBinCount` bins derived from the data
+ * range. NaN values are skipped (they are "missing", not values); a variable
+ * with no data yields the canonical empty statsV1 (count 0, zeroed fields,
+ * empty histogram), matching the mdio-python convention.
+ *
+ * Supported dtypes are float32, float64, and the signed/unsigned integer
+ * types; anything else (e.g. float16, complex, struct arrays) is rejected.
+ *
+ * \b Publishing: the result is not persisted by this call. The flow is
+ * ComputeStats, merge the statsV1 JSON into the variable's current
+ * attributes, update, then commit for durability:
+ * @code
+ * MDIO_ASSIGN_OR_RETURN(auto stats, mdio::ComputeStats(variable));
+ * nlohmann::json attrs = variable.GetAttributes();
+ * attrs["statsV1"] = stats.getBindable();
+ * MDIO_RETURN_IF_ERROR(variable.UpdateAttributes(attrs));
+ * MDIO_RETURN_IF_ERROR(dataset.CommitMetadata().status());
+ * @endcode
+ * `UpdateAttributes` replaces the whole UserAttributes, so start from
+ * `GetAttributes()` to preserve any existing attributes/units.
+ *
+ * @param var The variable to compute statistics over.
+ * @return The summary statistics, or an error for an unsupported dtype or a
+ * value that the float32 statsV1 fields cannot represent.
+ */
+Result<internal::SummaryStats> ComputeStats(
+    const Variable<void, dynamic_rank, ReadWriteMode::dynamic>& var);
+
+/**
+ * @brief Computes the statsV1 summary statistics of a variable with explicit
+ * histogram bin centers.
+ *
+ * Identical to the single-argument overload, except the histogram uses the
+ * supplied bin centers instead of deriving them from the data range. Values
+ * are assigned to the nearest bin center; a value exactly between two
+ * centers goes to the higher one, and values outside the center range are
+ * clamped to the first/last bin.
+ *
+ * This is the overload distributed callers should use: partials computed
+ * with the same explicit bin centers can be combined with MergeStats, while
+ * partials that each derive bins from their own sub-range cannot (their bin
+ * centers will not agree).
+ *
+ * @param var The variable to compute statistics over.
+ * @param binCenters The bin centers of the histogram. Must be non-empty and
+ * strictly increasing.
+ * @return The summary statistics, or an error for invalid bin centers, an
+ * unsupported dtype, or an unrepresentable value.
+ */
+Result<internal::SummaryStats> ComputeStats(
+    const Variable<void, dynamic_rank, ReadWriteMode::dynamic>& var,
+    absl::Span<const float> binCenters);
+
+/**
+ * @brief Order-independent combination of partial statsV1 results.
+ *
+ * Combines partials computed over disjoint subsets of a variable (e.g. by
+ * distributed callers) into the statsV1 of the whole: counts and sums add up,
+ * min/max fold, and histograms merge by summing per-bin counts.
+ *
+ * Histogram compatibility: every partial that carries data must either carry
+ * no histogram at all (empty binning, the mdio-python import convention) or
+ * carry a histogram with exactly the same binning (bin centers for centered
+ * histograms, bin edges and widths for edge-defined ones). Mixing histogram
+ * and non-histogram partials, or mismatched binnings, is an error — partials
+ * cannot be rebinned from counts alone. Use the explicit-bin-centers
+ * ComputeStats overload to produce compatible partials.
+ *
+ * Partials with a count of zero are neutral and contribute nothing (their
+ * zeroed min/max would otherwise poison the fold). If every partial is
+ * neutral, the result is the canonical empty statsV1.
+ *
+ * @param partials The partial results to combine, in any order.
+ * @return The combined summary statistics, or an error if no partial is
+ * supplied, the binnings are incompatible, or a total does not fit the
+ * statsV1 field types.
+ */
+inline Result<internal::SummaryStats> MergeStats(
+    absl::Span<const internal::SummaryStats> partials) {
+  if (partials.empty()) {
+    return absl::InvalidArgumentError(
+        "MergeStats requires at least one partial.");
+  }
+
+  int64_t count = 0;
+  double sum = 0.0;
+  double sumSquares = 0.0;
+  bool haveData = false;
+  double minValue = 0.0;
+  double maxValue = 0.0;
+
+  // The first data-carrying partial with a non-empty histogram defines the
+  // reference binning; every other data-carrying partial must match it.
+  nlohmann::json referenceHistogram;
+  std::vector<int64_t> mergedCounts;
+  bool haveHistogram = false;
+
+  for (const auto& partial : partials) {
+    if (partial.get_count() == 0) {
+      continue;  // Neutral partial: contributes nothing.
+    }
+
+    count += partial.get_count();
+    sum += partial.get_sum();
+    sumSquares += partial.get_sum_squares();
+    if (!haveData) {
+      minValue = partial.get_min();
+      maxValue = partial.get_max();
+      haveData = true;
+    } else {
+      minValue = std::min(minValue, static_cast<double>(partial.get_min()));
+      maxValue = std::max(maxValue, static_cast<double>(partial.get_max()));
+    }
+
+    const auto& histogram = partial.get_histogram();
+    if (histogram == nullptr) {
+      return absl::InvalidArgumentError(
+          "MergeStats: partial carries no histogram.");
+    }
+    nlohmann::json histogramJson = histogram->getHistogram()["histogram"];
+
+    const bool isCentered = histogramJson.contains("binCenters");
+    const bool isEdge = histogramJson.contains("binEdges");
+    if (!isCentered && !isEdge) {
+      return absl::InvalidArgumentError(
+          "MergeStats: partial carries an unrecognized histogram shape.");
+    }
+
+    // A histogram is "empty" when all of its arrays are empty (the
+    // mdio-python convention for "no histogram"); some-but-not-all empty
+    // arrays are malformed.
+    const nlohmann::json& countsJson = histogramJson["counts"];
+    bool allEmpty = countsJson.empty();
+    bool anyEmpty = countsJson.empty();
+    const std::vector<std::string> binningKeys =
+        isCentered ? std::vector<std::string>{"binCenters"}
+                   : std::vector<std::string>{"binEdges", "binWidths"};
+    for (const auto& key : binningKeys) {
+      allEmpty = allEmpty && histogramJson[key].empty();
+      anyEmpty = anyEmpty || histogramJson[key].empty();
+    }
+    if (anyEmpty && !allEmpty) {
+      return absl::InvalidArgumentError(
+          "MergeStats: partial carries a malformed histogram (some binning "
+          "arrays are empty and others are not).");
+    }
+
+    if (allEmpty) {
+      if (haveHistogram) {
+        return absl::InvalidArgumentError(
+            "MergeStats: cannot merge a partial without a histogram into "
+            "partials that have one.");
+      }
+      continue;
+    }
+
+    if (!haveHistogram) {
+      referenceHistogram = histogramJson;
+      mergedCounts.reserve(countsJson.size());
+      for (const auto& binCount : countsJson) {
+        mergedCounts.push_back(binCount.get<int64_t>());
+      }
+      haveHistogram = true;
+      continue;
+    }
+
+    const bool sameKind =
+        isCentered == referenceHistogram.contains("binCenters");
+    bool sameBinning = sameKind;
+    if (sameKind && isCentered) {
+      sameBinning =
+          histogramJson["binCenters"] == referenceHistogram["binCenters"];
+    } else if (sameKind) {
+      sameBinning = histogramJson["binEdges"] ==
+                        referenceHistogram["binEdges"] &&
+                    histogramJson["binWidths"] ==
+                        referenceHistogram["binWidths"];
+    }
+    if (!sameBinning) {
+      return absl::InvalidArgumentError(
+          "MergeStats: partials have incompatible histogram binnings; all "
+          "partials must share identical bin centers (or edges and widths). "
+          "Use the ComputeStats overload with explicit bin centers to "
+          "produce compatible partials.");
+    }
+    if (countsJson.size() != mergedCounts.size()) {
+      return absl::InvalidArgumentError(
+          "MergeStats: partial histogram counts length does not match the "
+          "reference binning.");
+    }
+    for (std::size_t index = 0; index < mergedCounts.size(); ++index) {
+      mergedCounts[index] += countsJson[index].get<int64_t>();
+    }
+  }
+
+  if (!haveData) {
+    // Every partial was neutral: the canonical empty statsV1.
+    return internal::SummaryStats::Create(
+        0, 0.0F, 0.0F, 0.0F, 0.0F,
+        std::make_unique<internal::CenteredBinHistogram<float>>(
+            std::vector<float>(), std::vector<int32_t>()));
+  }
+
+  if (count > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    return absl::InvalidArgumentError(
+        "MergeStats: total count " + std::to_string(count) +
+        " exceeds the int32 statsV1 count field.");
+  }
+  MDIO_ASSIGN_OR_RETURN(const float sumValue,
+                        internal::CheckedFloat(sum, "sum"));
+  MDIO_ASSIGN_OR_RETURN(const float sumSquaresValue,
+                        internal::CheckedFloat(sumSquares, "sumSquares"));
+  MDIO_ASSIGN_OR_RETURN(const float minValueF,
+                        internal::CheckedFloat(minValue, "min"));
+  MDIO_ASSIGN_OR_RETURN(const float maxValueF,
+                        internal::CheckedFloat(maxValue, "max"));
+
+  std::unique_ptr<const internal::Histogram> histogram;
+  if (haveHistogram) {
+    // Per-bin counts cannot overflow int32: each is at most the total count.
+    const std::vector<int32_t> counts(mergedCounts.begin(), mergedCounts.end());
+    if (referenceHistogram.contains("binCenters")) {
+      const std::vector<float> binCenters =
+          referenceHistogram["binCenters"].get<std::vector<float>>();
+      histogram = std::make_unique<internal::CenteredBinHistogram<float>>(
+          binCenters, counts);
+    } else {
+      const std::vector<float> binEdges =
+          referenceHistogram["binEdges"].get<std::vector<float>>();
+      const std::vector<float> binWidths =
+          referenceHistogram["binWidths"].get<std::vector<float>>();
+      histogram = std::make_unique<internal::EdgeDefinedHistogram<float>>(
+          binEdges, binWidths, counts);
+    }
+  } else {
+    histogram = std::make_unique<internal::CenteredBinHistogram<float>>(
+        std::vector<float>(), std::vector<int32_t>());
+  }
+
+  return internal::SummaryStats::Create(static_cast<int32_t>(count),
+                                        maxValueF, minValueF, sumValue,
+                                        sumSquaresValue, std::move(histogram));
+}
 
 }  // namespace mdio
 #endif  // MDIO_STATS_H_
