@@ -1262,24 +1262,8 @@ class Dataset {
           "All descriptors must be of the same type.");
     }
 
-    // Validate each descriptor (for example, ListDescriptor not yet supported)
+    // Validate each descriptor
     auto validateDescriptors = [this](auto& descriptor) {
-      using DescriptorType = typename outer_type<decltype(descriptor)>::type;
-      if constexpr (std::is_same_v<
-                        std::remove_reference_t<DescriptorType>,
-                        ListDescriptor<typename std::remove_reference_t<
-                            decltype(descriptor)>::type>>) {
-        return absl::UnimplementedError(
-            "Support for ListDescriptor is not yet implemented.");
-      }
-      // TODO(BrianMichell): Remove this check when SliceDescriptor is removed
-      if constexpr (std::is_same_v<DescriptorType, SliceDescriptor>) {
-        return absl::InvalidArgumentError(
-            "SliceDescriptor is deprecated and will be removed in future "
-            "versions. Please use RangeDescriptor instead.\nThe sel method "
-            "does not support SliceDescriptor.");
-      }
-
       MDIO_ASSIGN_OR_RETURN(
           auto var, variables.at(std::string(descriptor.label.label())));
       if (var.dimensions().rank() != 1) {
