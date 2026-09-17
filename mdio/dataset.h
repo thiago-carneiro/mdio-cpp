@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <functional>
@@ -30,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1075,15 +1077,32 @@ class Dataset {
    * value (xarray/pandas label-slicing semantics); unordered coordinates
    * require exact, unique endpoints. A start index after the stop index
    * is not supported.
+   * @param label The label of the coordinate axis being selected (used in
+   * error messages).
    * @param coords The coordinate values in index order.
    * @param descriptor The value-typed range descriptor.
    * @param out_endpoints Receives the {start, stop} indices into coords.
    */
   template <typename ValueType>
   static absl::Status resolve_range_endpoints(
-      const std::vector<ValueType>& coords,
+      const std::string_view label, const std::vector<ValueType>& coords,
       const RangeDescriptor<ValueType>& descriptor,
       std::pair<Index, Index>& out_endpoints) {
+    // A NaN on a floating-point axis corrupts everything downstream of
+    // here: the order classification is NaN-blind (std::is_sorted treats
+    // [1, 2, NaN, 4] as ascending) and the endpoint binary searches
+    // resolve bounds onto the NaN position, silently mis-anchoring the
+    // selection. A NaN-containing axis is corrupt; error loudly instead.
+    if constexpr (std::is_floating_point_v<ValueType>) {
+      if (std::any_of(coords.begin(), coords.end(),
+                      [](const ValueType value) {
+                        return std::isnan(value);
+                      })) {
+        return absl::InvalidArgumentError(
+            "Coordinate axis '" + std::string(label) +
+            "' contains NaN; range selection is not supported.");
+      }
+    }
     const CoordinateOrder order = classify_coordinate_order(coords);
     if (order == CoordinateOrder::kUnordered) {
       return resolve_exact_endpoints(coords, descriptor, out_endpoints);
@@ -1156,7 +1175,8 @@ class Dataset {
         }
 
         std::pair<Index, Index> endpoints;
-        trueStatus = resolve_range_endpoints(coords, descriptor, endpoints);
+        trueStatus = resolve_range_endpoints(descriptor.label.label(), coords,
+                                             descriptor, endpoints);
         if (!trueStatus.ok()) {
           return trueStatus;
         }

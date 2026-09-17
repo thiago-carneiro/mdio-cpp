@@ -505,6 +505,121 @@ mdio::Result<mdio::Dataset> makeMonotonicPopulated(const std::string& path) {
   return ds;
 }
 
+// A populated store with floating-point coordinate axes, two of them
+// NaN-poisoned (the nav-gap CDP-coordinate shape):
+//   inline    (ascending with NaN):  1, 2, NaN, 4
+//   crossline (descending with NaN): 4, NaN, 2, 1
+//   depth     (ascending, clean):    10, 20
+mdio::Result<mdio::Dataset> makeNaNAxisPopulated(const std::string& path) {
+  std::string schema = R"(
+{
+  "metadata": {
+    "name": "nanSelTester",
+    "apiVersion": "1.0.0",
+    "createdOn": "2024-08-23T08:56:00.000000-06:00"
+  },
+  "variables": [
+    {
+      "name": "data",
+      "dataType": "float32",
+      "dimensions": [
+        {"name": "inline", "size": 4},
+        {"name": "crossline", "size": 4},
+        {"name": "depth", "size": 2}
+      ]
+    },
+    {
+      "name": "inline",
+      "dataType": "float32",
+      "dimensions": [{"name": "inline", "size": 4}]
+    },
+    {
+      "name": "crossline",
+      "dataType": "float32",
+      "dimensions": [{"name": "crossline", "size": 4}]
+    },
+    {
+      "name": "depth",
+      "dataType": "float32",
+      "dimensions": [{"name": "depth", "size": 2}]
+    }
+  ]
+})";
+  nlohmann::json j = nlohmann::json::parse(schema);
+  auto dsFut = mdio::Dataset::from_json(j, path, mdio::constants::kCreateClean);
+  if (!dsFut.status().ok()) {
+    return dsFut.status();
+  }
+  auto ds = dsFut.value();
+  MDIO_ASSIGN_OR_RETURN(auto dataVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("data"));
+  MDIO_ASSIGN_OR_RETURN(auto inlineVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("inline"));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineVar, ds.variables.get<mdio::dtypes::float32_t>("crossline"));
+  MDIO_ASSIGN_OR_RETURN(auto depthVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("depth"));
+
+  MDIO_ASSIGN_OR_RETURN(auto dataData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(dataVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto inlineData, mdio::from_variable<mdio::dtypes::float32_t>(inlineVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineData,
+      mdio::from_variable<mdio::dtypes::float32_t>(crosslineVar));
+  MDIO_ASSIGN_OR_RETURN(auto depthData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(depthVar));
+
+  auto dataAccessor = dataData.get_data_accessor();
+  auto inlineAccessor = inlineData.get_data_accessor();
+  auto crosslineAccessor = crosslineData.get_data_accessor();
+  auto depthAccessor = depthData.get_data_accessor();
+
+  const float nanValue = std::numeric_limits<float>::quiet_NaN();
+  std::vector<mdio::dtypes::float32_t> inlineCoords({1, 2, nanValue, 4});
+  std::vector<mdio::dtypes::float32_t> crosslineCoords({4, nanValue, 2, 1});
+  std::vector<mdio::dtypes::float32_t> depthCoords({10, 20});
+
+  for (int i = 0; i < 4; ++i) {
+    inlineAccessor({i}) = inlineCoords[i];
+    crosslineAccessor({i}) = crosslineCoords[i];
+  }
+  for (int i = 0; i < 2; ++i) {
+    depthAccessor({i}) = depthCoords[i];
+  }
+
+  auto inlineFut = inlineVar.Write(inlineData);
+  auto crosslineFut = crosslineVar.Write(crosslineData);
+  auto depthFut = depthVar.Write(depthData);
+
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        dataAccessor({i, j, k}) =
+            inlineCoords[i] + crosslineCoords[j] * 0.1f +
+            static_cast<float>(k);
+      }
+    }
+  }
+
+  auto dataFut = dataVar.Write(dataData);
+
+  if (!inlineFut.status().ok()) {
+    return inlineFut.status();
+  }
+  if (!crosslineFut.status().ok()) {
+    return crosslineFut.status();
+  }
+  if (!depthFut.status().ok()) {
+    return depthFut.status();
+  }
+  if (!dataFut.status().ok()) {
+    return dataFut.status();
+  }
+
+  return ds;
+}
+
 // Reads all values of the 1-D int32 coordinate `label` from `dataset`.
 mdio::Result<std::vector<mdio::dtypes::int32_t>> readCoordinate(
     mdio::Dataset& dataset, const std::string& label) {
@@ -1222,6 +1337,56 @@ TEST(Dataset, selRangeDescendingFlippedStartStop) {
 
   auto sliceRes = ds.sel(ilRange);
   ASSERT_FALSE(sliceRes.status().ok());
+}
+
+// A NaN on a floating-point coordinate axis must fail the range selection
+// loudly. The order classification is NaN-blind ([1, 2, NaN, 4] passes
+// std::is_sorted) and the endpoint binary searches resolve bounds onto the
+// NaN position, so without the guard the range [3, 3.5] silently selects
+// at the NaN index instead of erroring.
+TEST(Dataset, selRangeNaNAxisErrors) {
+  std::string path = "zarrs/nanSelTester.mdio";
+  auto dsRes = makeNaNAxisPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [1, 2, NaN, 4]: classifies as ascending without the guard,
+  // and both endpoints of [3, 3.5] resolve onto the NaN position.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> ascRange = {"inline", 3, 3.5f,
+                                                             1};
+  auto ascRes = ds.sel(ascRange);
+  ASSERT_FALSE(ascRes.status().ok());
+  EXPECT_THAT(ascRes.status().message(), testing::HasSubstr("inline"));
+  EXPECT_THAT(ascRes.status().message(), testing::HasSubstr("NaN"));
+
+  // crossline = [4, NaN, 2, 1]: a descending axis with NaN errors too.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> descRange = {"crossline", 3,
+                                                              1.5f, 1};
+  auto descRes = ds.sel(descRange);
+  ASSERT_FALSE(descRes.status().ok());
+  EXPECT_THAT(descRes.status().message(), testing::HasSubstr("crossline"));
+  EXPECT_THAT(descRes.status().message(), testing::HasSubstr("NaN"));
+
+  // depth = [10, 20]: a clean floating-point axis still selects; the
+  // range [5, 15] snaps both endpoints to 10.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> cleanRange = {"depth", 5, 15,
+                                                               1};
+  auto cleanRes = ds.sel(cleanRange);
+  ASSERT_TRUE(cleanRes.status().ok()) << cleanRes.status();
+  auto depthVar =
+      cleanRes.value().variables.get<mdio::dtypes::float32_t>("depth");
+  ASSERT_TRUE(depthVar.status().ok()) << depthVar.status();
+  auto depthFut = depthVar.value().Read();
+  ASSERT_TRUE(depthFut.status().ok()) << depthFut.status();
+  auto depthData = depthFut.value();
+  auto depthAccessor = depthData.get_data_accessor();
+  auto depthOffset = depthData.get_flattened_offset();
+  std::vector<mdio::dtypes::float32_t> depthValues;
+  for (mdio::Index i = depthOffset;
+       i < depthVar.value().num_samples() + depthOffset; ++i) {
+    depthValues.push_back(depthAccessor({i}));
+  }
+  EXPECT_THAT(depthValues, testing::ElementsAre(testing::FloatEq(10.0f)));
 }
 
 // Unordered axes (the selTester inline axis repeats values) keep requiring
