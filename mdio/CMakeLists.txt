@@ -419,6 +419,29 @@ mdio_cc_test(
 
 mdio_cc_test(
   NAME
+    transform_test
+  SRCS
+    transform_test.cc
+  COPTS
+    ${mdio_DEFAULT_COPTS}
+  LINKOPTS
+    ${mdio_DEFAULT_LINKOPTS}
+  DEPS
+    GTest::gmock_main
+    tensorstore::driver_array
+    tensorstore::driver_zarr
+    tensorstore::driver_zarr3
+    tensorstore::driver_json
+    tensorstore::kvstore_file
+    tensorstore::stack
+    tensorstore::tensorstore
+    tensorstore::index_space_dim_expression
+    tensorstore::index_space_index_transform
+    tensorstore::util_status_testutil
+)
+
+mdio_cc_test(
+  NAME
     coordinate_selector_test
   SRCS
     coordinate_selector_test.cc
