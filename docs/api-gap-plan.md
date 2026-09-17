@@ -295,6 +295,25 @@ by C++ reads back in mdio-python.
 
 Size: ~1 week.
 
+*(Implemented, wave 4 — `f6cfa7c`. Parity verified against mdio-python
+1.0.8 on the SAME store: statsV1 written by C++ to a Zarr V3 store
+validates with `SummaryStatistics.model_validate` and matches the
+expected values (count/sum/sumSquares/min/max/histogram). Semantics
+decided where the plan was silent: default binning is 10 equal-width
+bins with midpoint edge assignment (ties go up, ends clamp into the
+edge bins); `min == max` collapses to a single bin; count==0 partials
+are neutral in `MergeStats`; histogram merge requires identical binning
+(mdio-python imports carry empty histograms — those merge scalars-only,
+keeping the histogram empty, which is also the canonical empty form).
+The declared policy change was executed: the stats.h:69-72 design note
+now documents the ComputeStats + UpdateAttributes path. Two fixture
+premises corrected at implementation: Zarr V3 rejects zero chunk
+entries (a zero-length dimension needs a unit chunk), and dataset
+validation requires coordinate variables for named dimensions (the
+publishing fixture declares inline/crossline coords). Suites:
+stats_test 45/45, variable_test 76/76, dataset_test 77+1skip —
+baselines held.)*
+
 ## M5 — Dtype-erased transfer
 
 Largely subsumed by M1 (copy round-trip) + existing Read/Write. The residual
