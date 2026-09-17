@@ -540,3 +540,35 @@ Good first PRs, independent of the milestones:
    but downstream pins exist.
 4. **Interop tests are two-directional** (mdio-python-written stores open in
    C++; C++-written stores open in mdio-python).
+
+## Robustness review (post-execution)
+
+Full adversarial review of `fcbfb85..d454e3c` (all waves): record at
+`.orquestra/pipeline/sdd/robustness-review-fcbfb85..d454e3c.md`. Verdict:
+merge with fixes. Fixed on `fix/api-gap-robustness` (all red-green
+verified — each test confirmed failing pre-fix):
+
+- CRITICAL: NaN on a floating-point coordinate axis silently mis-anchored
+  range selections (`std::is_sorted` is NaN-blind; the endpoint binary
+  searches resolved onto the NaN position — a silent-wrong-data
+  regression introduced by M3's nearest-value endpoints, which the
+  previous exact-match code rejected loudly). Now: `sel` range selection
+  rejects NaN-containing axes, naming the axis (`acd78eb`).
+- IMPORTANT: index-path opens silently dropped an indexed variable whose
+  metadata could not be read/parsed (partial copy, corruption, permission
+  error). Now: the index path fails the open naming the variable and its
+  zarr.json; the List fallback path stays lenient (groups are legitimate
+  there) (`d6a004f`).
+- `ExtractVariableNames` malformed-spec safety (was: nlohmann assertion
+  failure on missing/non-string `kvstore.path`) (`e9d3f0c`); start>stop
+  guard in `resolve_exact_endpoints` with a value-level message
+  (`038e819`).
+
+Filed as follow-ups (not blocking): statsV1 `FromJson` type-checking
+before conversion (pre-existing; M4's compute→publish→reopen cycle makes
+it routine — uncaught nlohmann exception on wrong-typed persisted
+statsV1); `ElementTransform` byte-count contract enforcement
+(span-based callback); stale-index-on-foreign-additions deserves a line
+in user-facing docs (externally added variables are invisible to
+index-based opens, and `CommitMetadata` regenerates the index without
+them).
