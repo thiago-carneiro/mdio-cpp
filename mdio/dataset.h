@@ -20,6 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -955,9 +956,160 @@ class Dataset {
     return current;
   }
 
+  /// The order of a 1-D coordinate axis. Internal use only.
+  enum class CoordinateOrder {
+    /// Non-decreasing values (ties allowed).
+    kAscending,
+    /// Non-increasing values (ties allowed).
+    kDescending,
+    /// Neither of the above; range endpoints must match exactly.
+    kUnordered,
+  };
+
+  /**
+   * @brief Internal use only.
+   * Classifies the order of a 1-D coordinate axis.
+   * @param coords The coordinate values in index order.
+   * @return kAscending, kDescending, or kUnordered.
+   */
+  template <typename ValueType>
+  static CoordinateOrder classify_coordinate_order(
+      const std::vector<ValueType>& coords) {
+    if (std::is_sorted(coords.begin(), coords.end())) {
+      return CoordinateOrder::kAscending;
+    }
+    if (std::is_sorted(coords.begin(), coords.end(),
+                       std::greater<ValueType>())) {
+      return CoordinateOrder::kDescending;
+    }
+    return CoordinateOrder::kUnordered;
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves a range endpoint against a monotonic coordinate axis to the
+   * index of the nearest contained value, mirroring xarray/pandas
+   * label-based slicing:
+   * - ascending start: first value >= bound
+   * - ascending stop: last value <= bound
+   * - descending start: first value <= bound
+   * - descending stop: last value >= bound
+   * A bound with no contained value (entirely outside the axis) is an
+   * error rather than a clamp.
+   * @param order The axis order; must not be kUnordered.
+   * @param is_start True for the start endpoint, false for the stop.
+   * @param coords The monotonic coordinate values in index order.
+   * @param bound The endpoint value from the descriptor.
+   * @return The index of the nearest contained value.
+   */
+  template <typename ValueType>
+  static Result<Index> nearest_contained_index(
+      const CoordinateOrder order, const bool is_start,
+      const std::vector<ValueType>& coords, const ValueType bound) {
+    if (is_start) {
+      const auto it =
+          order == CoordinateOrder::kAscending
+              ? std::lower_bound(coords.begin(), coords.end(), bound)
+              : std::lower_bound(coords.begin(), coords.end(), bound,
+                                 std::greater<ValueType>());
+      if (it == coords.end()) {
+        return absl::InvalidArgumentError("Start value not found.");
+      }
+      return static_cast<Index>(it - coords.begin());
+    }
+    const auto it = order == CoordinateOrder::kAscending
+                        ? std::upper_bound(coords.begin(), coords.end(), bound)
+                        : std::upper_bound(coords.begin(), coords.end(), bound,
+                                           std::greater<ValueType>());
+    if (it == coords.begin()) {
+      return absl::InvalidArgumentError("Stop value not found.");
+    }
+    return static_cast<Index>(it - coords.begin() - 1);
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves range endpoints against an unordered coordinate axis.
+   * Unordered axes cannot snap to a nearest contained value, so both
+   * endpoints must match a coordinate exactly, and each endpoint value
+   * must be unique on the axis.
+   * @param coords The coordinate values in index order.
+   * @param descriptor The value-typed range descriptor.
+   * @param out_endpoints Receives the {start, stop} indices into coords.
+   */
+  template <typename ValueType>
+  static absl::Status resolve_exact_endpoints(
+      const std::vector<ValueType>& coords,
+      const RangeDescriptor<ValueType>& descriptor,
+      std::pair<Index, Index>& out_endpoints) {
+    std::pair<bool, Index> start = {false, 0};
+    std::pair<bool, Index> stop = {false, 0};
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (coords[i] == descriptor.start) {
+        if (start.first) {
+          return absl::InvalidArgumentError("Repeated start value.");
+        }
+        start = {true, static_cast<Index>(i)};
+      }
+      if (coords[i] == descriptor.stop) {
+        if (stop.first) {
+          return absl::InvalidArgumentError("Repeated stop value.");
+        }
+        stop = {true, static_cast<Index>(i)};
+      }
+    }
+    if (!start.first) {
+      return absl::InvalidArgumentError("Start value not found.");
+    }
+    if (!stop.first) {
+      return absl::InvalidArgumentError("Stop value not found.");
+    }
+    out_endpoints = {start.second, stop.second};
+    return absl::OkStatus();
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves the endpoints of a range selection to coordinate indices.
+   * Monotonic coordinates snap each endpoint to the nearest contained
+   * value (xarray/pandas label-slicing semantics); unordered coordinates
+   * require exact, unique endpoints. A start index after the stop index
+   * is not supported.
+   * @param coords The coordinate values in index order.
+   * @param descriptor The value-typed range descriptor.
+   * @param out_endpoints Receives the {start, stop} indices into coords.
+   */
+  template <typename ValueType>
+  static absl::Status resolve_range_endpoints(
+      const std::vector<ValueType>& coords,
+      const RangeDescriptor<ValueType>& descriptor,
+      std::pair<Index, Index>& out_endpoints) {
+    const CoordinateOrder order = classify_coordinate_order(coords);
+    if (order == CoordinateOrder::kUnordered) {
+      return resolve_exact_endpoints(coords, descriptor, out_endpoints);
+    }
+    MDIO_ASSIGN_OR_RETURN(
+        const Index startIndex,
+        nearest_contained_index(order, true, coords, descriptor.start));
+    MDIO_ASSIGN_OR_RETURN(
+        const Index stopIndex,
+        nearest_contained_index(order, false, coords, descriptor.stop));
+    if (startIndex > stopIndex) {
+      return absl::UnimplementedError(
+          "Start value happens after stop value. This is not a supported "
+          "case.");
+    }
+    out_endpoints = {startIndex, stopIndex};
+    return absl::OkStatus();
+  }
+
   /**
    * @brief Internal use only.
    * Converts the `sel` descriptors to their `isel` equivalents.
+   * For `ValueDescriptor` and `ListDescriptor`, each label maps to the
+   * indices of every occurrence of the requested values. For
+   * `RangeDescriptor`, each label maps to the resolved
+   * {start_index, stop_index} pair of the range endpoints.
    */
   template <typename... Descriptors>
   Result<std::map<std::string_view, std::vector<Index>>> descriptor_to_index(
@@ -989,8 +1141,34 @@ class Dataset {
       auto offset = varDat.get_flattened_offset();
       if constexpr ((std::is_same_v<
                          Descriptors,
-                         ListDescriptor<typename Descriptors::type>> &&
+                         RangeDescriptor<typename Descriptors::type>> &&
                      ...)) {
+        if (descriptor.start == descriptor.stop) {
+          trueStatus = absl::InvalidArgumentError(
+              "Start and stop values must be different.");
+          return trueStatus;
+        }
+
+        std::vector<ValueType> coords;
+        coords.reserve(var.num_samples());
+        for (Index i = offset; i < var.num_samples() + offset; ++i) {
+          coords.push_back(varAccessor({i}));
+        }
+
+        std::pair<Index, Index> endpoints;
+        trueStatus = resolve_range_endpoints(coords, descriptor, endpoints);
+        if (!trueStatus.ok()) {
+          return trueStatus;
+        }
+
+        // Store the resolved {start, stop} pair (offset-based, like the
+        // Value/List paths) for `sel` to convert into an `isel` range.
+        label_to_indices[descriptor.label.label()] = {
+            endpoints.first + offset, endpoints.second + offset};
+      } else if constexpr ((std::is_same_v<
+                                Descriptors,
+                                ListDescriptor<typename Descriptors::type>> &&
+                            ...)) {
         std::set<ValueType> values;
         for (auto val : descriptor.values) {
           if (values.count(val) > 0) {
@@ -1197,94 +1375,21 @@ class Dataset {
       return isel(
           static_cast<const std::vector<RangeDescriptor<Index>>&>(slices));
     } else {
-      std::map<std::string_view, std::pair<Index, Index>>
-          label_to_range;  // pair.first = start, pair.second = stop
-      absl::Status trueStatus =
-          absl::OkStatus();  // A hack to allow for true error status return.
-
-      auto processDescriptor = [this, &label_to_range,
-                                &trueStatus](auto& descriptor) -> absl::Status {
-        using ValueType =
-            typename extract_descriptor_Ttype<decltype(descriptor)>::type;
-
-        if (descriptor.start == descriptor.stop) {
-          trueStatus = absl::InvalidArgumentError(
-              "Start and stop values must be different.");
-          return trueStatus;
-        }
-
-        auto varRes =
-            variables.get<ValueType>(std::string(descriptor.label.label()));
-        if (!varRes.status().ok()) {
-          trueStatus = varRes.status();
-          return trueStatus;
-        }
-        auto var = varRes.value();
-        auto varFut = var.Read();
-        if (!varFut.status().ok()) {
-          trueStatus = varFut.status();
-          return trueStatus;
-        }
-        auto varDat = varFut.value();
-        auto varAccessor = varDat.get_data_accessor();
-
-        std::pair<bool, Index> start = {false, 0};
-        std::pair<bool, Index> stop = {false, 0};
-        auto offset = varDat.get_flattened_offset();
-
-        for (Index i = offset; i < var.num_samples() + offset; i++) {
-          if (varAccessor({i}) == descriptor.start) {
-            if (start.first) {
-              trueStatus = absl::InvalidArgumentError("Repeated start value.");
-              return trueStatus;
-            }
-            start = {true, i};
-          }
-          if (varAccessor({i}) == descriptor.stop) {
-            if (stop.first) {
-              trueStatus = absl::InvalidArgumentError("Repeated stop value.");
-              return trueStatus;
-            }
-            stop = {true, i};
-          }
-        }
-
-        if (!start.first) {
-          trueStatus = absl::InvalidArgumentError("Start value not found.");
-          return trueStatus;
-        }
-        if (!stop.first) {
-          trueStatus = absl::InvalidArgumentError("Stop value not found.");
-          return trueStatus;
-        }
-
-        // Xarray behavior is to effectively remove the Variable in this case.
-        if (start.second >= stop.second) {
-          trueStatus = absl::UnimplementedError(
-              "Start value happens after stop value. This is not a supported "
-              "case.");
-          return trueStatus;
-        }
-        // This case should be caught by the earlier check, but it's here for
-        // completeness.
-        if (label_to_range.count(descriptor.label.label()) > 0) {
-          trueStatus =
-              absl::InvalidArgumentError("Label must not be repeated.");
-          return trueStatus;
-        }
-        label_to_range[descriptor.label.label()] = {start.second, stop.second};
-        return absl::OkStatus();
-      };
-
-      auto status = (processDescriptor(descriptors).ok() && ...);
-      if (!status) {
-        return trueStatus;
+      // RangeDescriptor: `descriptor_to_index` resolves each endpoint to
+      // the nearest contained coordinate value (monotonic axes) or to an
+      // exact, unique match (unordered axes).
+      auto slicer = descriptor_to_index(descriptors...);
+      if (!slicer.status().ok()) {
+        return slicer.status();
       }
 
+      auto label_to_indices = slicer.value();
+
+      // Each entry holds the resolved {start_index, stop_index} pair.
       std::vector<RangeDescriptor<Index>> slices;
-      for (auto& elem : label_to_range) {
+      for (auto& elem : label_to_indices) {
         slices.emplace_back(RangeDescriptor<Index>(
-            {elem.first, elem.second.first, elem.second.second + 1, 1}));
+            {elem.first, elem.second.front(), elem.second.back() + 1, 1}));
       }
 
       if (slices.empty()) {

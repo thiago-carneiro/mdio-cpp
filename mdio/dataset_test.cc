@@ -390,6 +390,141 @@ mdio::Result<mdio::Dataset> makePopulated(const std::string& path) {
   return ds;
 }
 
+// A populated store whose coordinate axes are monotonic with non-uniform
+// steps, so nearest-value endpoint selection is observable:
+//   inline    (descending): 20, 18, 15, 12, 10, 8, 5, 3, 2, 1
+//   crossline (ascending):   0,  2,  5,  9, 14, 20, 27, 35, 44, 54
+//   depth     (ascending):   0,  1,  2,  3
+mdio::Result<mdio::Dataset> makeMonotonicPopulated(const std::string& path) {
+  std::string schema = R"(
+{
+  "metadata": {
+    "name": "monotonicSelTester",
+    "apiVersion": "1.0.0",
+    "createdOn": "2024-08-23T08:56:00.000000-06:00"
+  },
+  "variables": [
+    {
+      "name": "data",
+      "dataType": "float32",
+      "dimensions": [
+        {"name": "inline", "size": 10},
+        {"name": "crossline", "size": 10},
+        {"name": "depth", "size": 4}
+      ]
+    },
+    {
+      "name": "inline",
+      "dataType": "int32",
+      "dimensions": [{"name": "inline", "size": 10}]
+    },
+    {
+      "name": "crossline",
+      "dataType": "int32",
+      "dimensions": [{"name": "crossline", "size": 10}]
+    },
+    {
+      "name": "depth",
+      "dataType": "int32",
+      "dimensions": [{"name": "depth", "size": 4}]
+    }
+  ]
+})";
+  nlohmann::json j = nlohmann::json::parse(schema);
+  auto dsFut = mdio::Dataset::from_json(j, path, mdio::constants::kCreateClean);
+  if (!dsFut.status().ok()) {
+    return dsFut.status();
+  }
+  auto ds = dsFut.value();
+  MDIO_ASSIGN_OR_RETURN(auto dataVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("data"));
+  MDIO_ASSIGN_OR_RETURN(auto inlineVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("inline"));
+  MDIO_ASSIGN_OR_RETURN(auto crosslineVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("crossline"));
+  MDIO_ASSIGN_OR_RETURN(auto depthVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("depth"));
+
+  MDIO_ASSIGN_OR_RETURN(auto dataData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(dataVar));
+  MDIO_ASSIGN_OR_RETURN(auto inlineData,
+                        mdio::from_variable<mdio::dtypes::int32_t>(inlineVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineData,
+      mdio::from_variable<mdio::dtypes::int32_t>(crosslineVar));
+  MDIO_ASSIGN_OR_RETURN(auto depthData,
+                        mdio::from_variable<mdio::dtypes::int32_t>(depthVar));
+
+  auto dataAccessor = dataData.get_data_accessor();
+  auto inlineAccessor = inlineData.get_data_accessor();
+  auto crosslineAccessor = crosslineData.get_data_accessor();
+  auto depthAccessor = depthData.get_data_accessor();
+
+  std::vector<mdio::dtypes::int32_t> inlineCoords(
+      {20, 18, 15, 12, 10, 8, 5, 3, 2, 1});
+  std::vector<mdio::dtypes::int32_t> crosslineCoords(
+      {0, 2, 5, 9, 14, 20, 27, 35, 44, 54});
+
+  for (int i = 0; i < 10; ++i) {
+    inlineAccessor({i}) = inlineCoords[i];
+    crosslineAccessor({i}) = crosslineCoords[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    depthAccessor({i}) = i;
+  }
+
+  auto inlineFut = inlineVar.Write(inlineData);
+  auto crosslineFut = crosslineVar.Write(crosslineData);
+  auto depthFut = depthVar.Write(depthData);
+
+  for (int i = 0; i < 10; ++i) {
+    for (int j = 0; j < 10; ++j) {
+      for (int k = 0; k < 4; ++k) {
+        dataAccessor({i, j, k}) = static_cast<float>(inlineCoords[i]) +
+                                  crosslineCoords[j] * 0.1f +
+                                  static_cast<float>(k);
+      }
+    }
+  }
+
+  auto dataFut = dataVar.Write(dataData);
+
+  if (!inlineFut.status().ok()) {
+    return inlineFut.status();
+  }
+  if (!crosslineFut.status().ok()) {
+    return crosslineFut.status();
+  }
+  if (!depthFut.status().ok()) {
+    return depthFut.status();
+  }
+  if (!dataFut.status().ok()) {
+    return dataFut.status();
+  }
+
+  return ds;
+}
+
+// Reads all values of the 1-D int32 coordinate `label` from `dataset`.
+mdio::Result<std::vector<mdio::dtypes::int32_t>> readCoordinate(
+    mdio::Dataset& dataset, const std::string& label) {
+  MDIO_ASSIGN_OR_RETURN(auto var,
+                        dataset.variables.get<mdio::dtypes::int32_t>(label));
+  auto readFut = var.Read();
+  if (!readFut.status().ok()) {
+    return readFut.status();
+  }
+  auto data = readFut.value();
+  auto accessor = data.get_data_accessor();
+  auto offset = data.get_flattened_offset();
+  std::vector<mdio::dtypes::int32_t> values;
+  values.reserve(var.num_samples());
+  for (mdio::Index i = offset; i < var.num_samples() + offset; ++i) {
+    values.push_back(accessor({i}));
+  }
+  return values;
+}
+
 TEST(DatasetSpec, valid) {
   auto dataset = make();
 
@@ -931,6 +1066,183 @@ TEST(Dataset, selRepeatedRangeStop) {
   ASSERT_FALSE(sliceRes.status().ok());
 }
 
+// Range endpoints on a monotonic axis select the nearest contained
+// coordinate value (xarray/pandas label-slicing semantics), verified
+// against mdio-python on the same store.
+TEST(Dataset, selRangeNearestValueAscending) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // crossline = [0, 2, 5, 9, 14, 20, 27, 35, 44, 54]
+  // Start 1 snaps up to 2; stop 40 snaps down to 35.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> xlRange = {"crossline", 1, 40,
+                                                          1};
+  auto sliceRes = ds.sel(xlRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "crossline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(2, 5, 9, 14, 20, 27, 35));
+
+  // Both endpoints snap to the same contained value: a single sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> singleRange = {"crossline", 40,
+                                                              50, 1};
+  auto singleRes = ds.sel(singleRange);
+  ASSERT_TRUE(singleRes.ok()) << singleRes.status();
+  auto singleCoordsRes = readCoordinate(singleRes.value(), "crossline");
+  ASSERT_TRUE(singleCoordsRes.ok()) << singleCoordsRes.status();
+  EXPECT_THAT(singleCoordsRes.value(), testing::ElementsAre(44));
+}
+
+// Endpoints partially outside a monotonic axis clamp to the contained
+// edge rather than erroring.
+TEST(Dataset, selRangeNearestValueAscendingClampsToEnds) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Start -3 is below the minimum 0; it clamps to the first sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> lowRange = {"crossline", -3, 5,
+                                                           1};
+  auto lowRes = ds.sel(lowRange);
+  ASSERT_TRUE(lowRes.ok()) << lowRes.status();
+  auto lowCoordsRes = readCoordinate(lowRes.value(), "crossline");
+  ASSERT_TRUE(lowCoordsRes.ok()) << lowCoordsRes.status();
+  EXPECT_THAT(lowCoordsRes.value(), testing::ElementsAre(0, 2, 5));
+
+  // Stop 60 is above the maximum 54; it clamps to the last sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> highRange = {"crossline", 40, 60,
+                                                            1};
+  auto highRes = ds.sel(highRange);
+  ASSERT_TRUE(highRes.ok()) << highRes.status();
+  auto highCoordsRes = readCoordinate(highRes.value(), "crossline");
+  ASSERT_TRUE(highCoordsRes.ok()) << highCoordsRes.status();
+  EXPECT_THAT(highCoordsRes.value(), testing::ElementsAre(44, 54));
+}
+
+// Descending axes mirror the ascending semantics: start selects the
+// first value <= bound, stop the last value >= bound (mdio-python
+// behavior, verified empirically).
+TEST(Dataset, selRangeNearestValueDescending) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [20, 18, 15, 12, 10, 8, 5, 3, 2, 1]
+  // Start 17 snaps down to 15; stop 4 snaps up to 5.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 17, 4, 1};
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "inline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(15, 12, 10, 8, 5));
+
+  // Start 19 snaps down to 18; stop 2 is exact.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> snapRange = {"inline", 19, 2, 1};
+  auto snapRes = ds.sel(snapRange);
+  ASSERT_TRUE(snapRes.ok()) << snapRes.status();
+  auto snapCoordsRes = readCoordinate(snapRes.value(), "inline");
+  ASSERT_TRUE(snapCoordsRes.ok()) << snapCoordsRes.status();
+  EXPECT_THAT(snapCoordsRes.value(),
+              testing::ElementsAre(18, 15, 12, 10, 8, 5, 3, 2));
+}
+
+// Endpoints partially outside a descending axis clamp to the contained
+// edge (mdio-python behavior, verified empirically).
+TEST(Dataset, selRangeNearestValueDescendingClampsToEnds) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Start 25 is above the maximum 20; it clamps to the first sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> highRange = {"inline", 25, 10,
+                                                            1};
+  auto highRes = ds.sel(highRange);
+  ASSERT_TRUE(highRes.ok()) << highRes.status();
+  auto highCoordsRes = readCoordinate(highRes.value(), "inline");
+  ASSERT_TRUE(highCoordsRes.ok()) << highCoordsRes.status();
+  EXPECT_THAT(highCoordsRes.value(), testing::ElementsAre(20, 18, 15, 12, 10));
+
+  // Stop 0 is below the minimum 1; it clamps to the last sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> lowRange = {"inline", 15, 0, 1};
+  auto lowRes = ds.sel(lowRange);
+  ASSERT_TRUE(lowRes.ok()) << lowRes.status();
+  auto lowCoordsRes = readCoordinate(lowRes.value(), "inline");
+  ASSERT_TRUE(lowCoordsRes.ok()) << lowCoordsRes.status();
+  EXPECT_THAT(lowCoordsRes.value(),
+              testing::ElementsAre(15, 12, 10, 8, 5, 3, 2, 1));
+}
+
+// Endpoints entirely outside the axis are an error, not a clamp to the
+// nearest edge and not an empty selection.
+TEST(Dataset, selRangeEntirelyOutsideRange) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Ascending axis [0 .. 54]: start beyond the maximum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ascStart = {"crossline", 60, 70,
+                                                           1};
+  auto ascStartRes = ds.sel(ascStart);
+  EXPECT_FALSE(ascStartRes.status().ok());
+
+  // Ascending axis: stop below the minimum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ascStop = {"crossline", -10, -5,
+                                                          1};
+  auto ascStopRes = ds.sel(ascStop);
+  EXPECT_FALSE(ascStopRes.status().ok());
+
+  // Descending axis [20 .. 1]: stop beyond the maximum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> descStop = {"inline", 30, 40, 1};
+  auto descStopRes = ds.sel(descStop);
+  EXPECT_FALSE(descStopRes.status().ok());
+
+  // Descending axis: start below the minimum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> descStart = {"inline", -5, 0, 1};
+  auto descStartRes = ds.sel(descStart);
+  EXPECT_FALSE(descStartRes.status().ok());
+}
+
+// A start endpoint that resolves after the stop endpoint (flipped
+// selection) is not supported, on descending axes as on ascending ones.
+TEST(Dataset, selRangeDescendingFlippedStartStop) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [20, 18, 15, 12, 10, 8, 5, 3, 2, 1]
+  // Start 3 resolves to index 6; stop 18 resolves to index 1.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 3, 18, 1};
+
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_FALSE(sliceRes.status().ok());
+}
+
+// Unordered axes (the selTester inline axis repeats values) keep requiring
+// exact, unique endpoints; the selection is positional between them.
+// mdio-python returns [2, 3, 4, 3, 5] for the same slice on this store.
+TEST(Dataset, selRangeUnorderedExactEndpoints) {
+  std::string path = "zarrs/selTester.mdio";
+  auto dsRes = makePopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [1, 2, 3, 4, 3, 5, 6, 7, 8, 8]
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 2, 5, 1};
+
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "inline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(2, 3, 4, 3, 5));
+}
+
 TEST(Dataset, selectField) {
   auto json_var = GetToyExample();
 
@@ -1433,9 +1745,9 @@ TEST(Dataset, openV3WithoutDatasetMetadata) {
   std::filesystem::remove_all(path);
 
   auto json_vars = GetToyExample();
-  auto created = mdio::Dataset::from_json(
-      json_vars, path, mdio::zarr::ZarrVersion::kV3,
-      mdio::constants::kCreateClean);
+  auto created =
+      mdio::Dataset::from_json(json_vars, path, mdio::zarr::ZarrVersion::kV3,
+                               mdio::constants::kCreateClean);
   ASSERT_TRUE(created.status().ok()) << created.status();
 
   RewriteRootAsPythonWritten(path);
@@ -1464,9 +1776,9 @@ TEST(Dataset, openV3WithDatasetMetadata) {
   std::filesystem::remove_all(path);
 
   auto json_vars = GetToyExample();
-  auto created = mdio::Dataset::from_json(
-      json_vars, path, mdio::zarr::ZarrVersion::kV3,
-      mdio::constants::kCreateClean);
+  auto created =
+      mdio::Dataset::from_json(json_vars, path, mdio::zarr::ZarrVersion::kV3,
+                               mdio::constants::kCreateClean);
   ASSERT_TRUE(created.status().ok()) << created.status();
 
   CapturingLogSink sink;
