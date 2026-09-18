@@ -23,6 +23,7 @@ The goal of this user guide is to provide an introduction on how you may want to
 - [Write](#write)
 - [Efficient Assignment (Advanced)](#efficient-assignment-advanced)
 - [Mutable Metadata](#mutable-metadata)
+  - [Variable index semantics](#variable-index-semantics)
 
 ## Getting started
 This user guide will assume that you are working in either the provided [devcontainer](https://github.com/TGSAI/mdio-cpp/.devcontainer) or have your environment configured according to the [README](https://github.com/TGSAI/mdio-cpp/README.md). Please ensure you have the [required tools](https://github.com/TGSAI/mdio-cpp?tab=readme-ov-file#requied-tools) before proceeding. Following these guidelines should ensure a stable and consistent experience and will allow the community to provide better support without any guesswork regarding your environment.
@@ -596,3 +597,6 @@ mdio::Future<void> UpdateStats(mdio::Dataset& ds) {
   return ds.CommitMetadata();
 }
 ```
+
+### Variable index semantics
+Zarr v3 stores written by MDIO keep a variable index in the root metadata (the `_mdio_variable_index` attribute) so `Open` can resolve variables without listing the whole store. The index is authoritative: an open of an indexed store sees exactly the variables it lists. Variables added by other tooling (outside MDIO) are invisible to it, and `CommitMetadata` regenerates the index from the variables the `Dataset` holds — excluding them — so a metadata commit on such a store perpetuates the gap. If you add variables externally, remove the `_mdio_variable_index` attribute from the root `zarr.json` before the next open: without an index, `Open` falls back to listing the store and sees every variable.
