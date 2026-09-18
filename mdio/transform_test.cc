@@ -214,12 +214,12 @@ char* WritableDestination(std::string_view dst_bytes) {
 /// Scalar transform: multiplies a float32 element by `gain`.
 mdio::ElementTransform MakeFloat32Gain(const float gain) {
   return [gain](std::string_view src_bytes,
-                std::string_view dst_bytes) -> absl::Status {
+                std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     float value;
     std::memcpy(&value, src_bytes.data(), sizeof(value));
     value *= gain;
     std::memcpy(WritableDestination(dst_bytes), &value, sizeof(value));
-    return absl::OkStatus();
+    return sizeof(value);
   };
 }
 
@@ -228,7 +228,7 @@ mdio::ElementTransform MakeFloat32Gain(const float gain) {
 /// 6-byte record, so the test fails loudly if the unit is not the record.
 mdio::ElementTransform MakeRecordTransform() {
   return [](std::string_view src_bytes,
-            std::string_view dst_bytes) -> absl::Status {
+            std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     constexpr std::size_t kRecordSize = 6;
     if (src_bytes.size() != kRecordSize || dst_bytes.size() != kRecordSize) {
       return absl::InternalError("record unit is not 6 bytes");
@@ -239,7 +239,7 @@ mdio::ElementTransform MakeRecordTransform() {
     std::memcpy(WritableDestination(dst_bytes), &fieldA, sizeof(fieldA));
     std::memcpy(WritableDestination(dst_bytes) + sizeof(fieldA),
                 src_bytes.data() + sizeof(fieldA), sizeof(std::int32_t));
-    return absl::OkStatus();
+    return kRecordSize;
   };
 }
 
@@ -389,10 +389,10 @@ TEST(TransformVariableTest, IdentityEqualsDirectCopy) {
 
   mdio::ElementTransform identity =
       [](std::string_view src_bytes,
-         std::string_view dst_bytes) -> absl::Status {
+         std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     std::memcpy(WritableDestination(dst_bytes), src_bytes.data(),
                 src_bytes.size());
-    return absl::OkStatus();
+    return src_bytes.size();
   };
   auto transformFuture = mdio::TransformVariable(
       src.value(), dstTransform.value(), std::move(identity));
@@ -536,14 +536,14 @@ TEST(TransformVariableTest, FnErrorLeavesDstUntouched) {
   auto calls = std::make_shared<int>(0);
   mdio::ElementTransform failing =
       [calls](std::string_view src_bytes,
-              std::string_view dst_bytes) -> absl::Status {
+              std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     ++(*calls);
     if (*calls > 10) {
       return absl::InternalError("transform failed mid-way");
     }
     std::memcpy(WritableDestination(dst_bytes), src_bytes.data(),
                 src_bytes.size());
-    return absl::OkStatus();
+    return src_bytes.size();
   };
   auto transformFuture =
       mdio::TransformVariable(src.value(), dst.value(), std::move(failing));
@@ -553,6 +553,75 @@ TEST(TransformVariableTest, FnErrorLeavesDstUntouched) {
   EXPECT_EQ(11, *calls);
 
   // dst keeps its prior contents: the partial buffer was never submitted.
+  const std::vector<float> got = ReadFloat32Values(dst.value());
+  ASSERT_EQ(sentinel.size(), got.size());
+  for (std::size_t index = 0; index < sentinel.size(); ++index) {
+    EXPECT_FLOAT_EQ(sentinel[index], got[index]);
+  }
+}
+
+TEST(TransformVariableTest, UnderReportedByteCountRejected) {
+  const std::vector<float> values = SequentialValues(0.0F, 20);
+  auto src = MakePopulatedVariable<float>("transform_test_under_src", "float32",
+                                          {4, 5}, values);
+  ASSERT_TRUE(src.ok()) << src.status();
+  const std::vector<float> sentinel(20, 7.0F);
+  auto dst = MakePopulatedVariable<float>("transform_test_under_dst", "float32",
+                                          {4, 5}, sentinel);
+  ASSERT_TRUE(dst.ok()) << dst.status();
+
+  // Writes the full 4-byte element but reports only 2 bytes.
+  mdio::ElementTransform underReporting =
+      [](std::string_view src_bytes,
+         std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
+    std::memcpy(WritableDestination(dst_bytes), src_bytes.data(),
+                src_bytes.size());
+    return 2;
+  };
+  const absl::Status status = mdio::TransformVariable(src.value(), dst.value(),
+                                                      std::move(underReporting))
+                                  .status();
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(absl::StatusCode::kInternal, status.code());
+  EXPECT_THAT(status.message(),
+              ::testing::HasSubstr("transform_test_under_dst"));
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("reported writing 2"));
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("holds 4"));
+
+  // dst keeps its prior contents: the partial buffer was never submitted.
+  const std::vector<float> got = ReadFloat32Values(dst.value());
+  ASSERT_EQ(sentinel.size(), got.size());
+  for (std::size_t index = 0; index < sentinel.size(); ++index) {
+    EXPECT_FLOAT_EQ(sentinel[index], got[index]);
+  }
+}
+
+TEST(TransformVariableTest, OverReportedByteCountRejected) {
+  const std::vector<float> values = SequentialValues(0.0F, 20);
+  auto src = MakePopulatedVariable<float>("transform_test_over_src", "float32",
+                                          {4, 5}, values);
+  ASSERT_TRUE(src.ok()) << src.status();
+  const std::vector<float> sentinel(20, 7.0F);
+  auto dst = MakePopulatedVariable<float>("transform_test_over_dst", "float32",
+                                          {4, 5}, sentinel);
+  ASSERT_TRUE(dst.ok()) << dst.status();
+
+  // Writes nothing but reports 8 bytes for a 4-byte element.
+  mdio::ElementTransform overReporting =
+      [](std::string_view, std::string_view) -> absl::StatusOr<std::size_t> {
+    return 8;
+  };
+  const absl::Status status = mdio::TransformVariable(src.value(), dst.value(),
+                                                      std::move(overReporting))
+                                  .status();
+  ASSERT_FALSE(status.ok());
+  EXPECT_EQ(absl::StatusCode::kInternal, status.code());
+  EXPECT_THAT(status.message(),
+              ::testing::HasSubstr("transform_test_over_dst"));
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("reported writing 8"));
+  EXPECT_THAT(status.message(), ::testing::HasSubstr("holds 4"));
+
+  // dst keeps its prior contents: nothing was ever submitted.
   const std::vector<float> got = ReadFloat32Values(dst.value());
   ASSERT_EQ(sentinel.size(), got.size());
   for (std::size_t index = 0; index < sentinel.size(); ++index) {
@@ -572,13 +641,14 @@ TEST(TransformVariableTest, Int16Gain) {
                                                  "int16", {3, 6}, {});
   ASSERT_TRUE(dst.ok()) << dst.status();
 
-  mdio::ElementTransform gain = [](std::string_view src_bytes,
-                                   std::string_view dst_bytes) -> absl::Status {
+  mdio::ElementTransform gain =
+      [](std::string_view src_bytes,
+         std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     std::int16_t value;
     std::memcpy(&value, src_bytes.data(), sizeof(value));
     value = static_cast<std::int16_t>(value * 3);
     std::memcpy(WritableDestination(dst_bytes), &value, sizeof(value));
-    return absl::OkStatus();
+    return sizeof(value);
   };
   auto status =
       mdio::TransformVariable(src.value(), dst.value(), std::move(gain))
@@ -610,12 +680,12 @@ TEST(TransformVariableTest, Float64Scale) {
 
   mdio::ElementTransform scale =
       [](std::string_view src_bytes,
-         std::string_view dst_bytes) -> absl::Status {
+         std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     double value;
     std::memcpy(&value, src_bytes.data(), sizeof(value));
     value *= 0.5;
     std::memcpy(WritableDestination(dst_bytes), &value, sizeof(value));
-    return absl::OkStatus();
+    return sizeof(value);
   };
   auto status =
       mdio::TransformVariable(src.value(), dst.value(), std::move(scale))
@@ -647,12 +717,12 @@ TEST(TransformVariableTest, CrossDtypeInt16ToFloat32) {
 
   mdio::ElementTransform toFloat =
       [](std::string_view src_bytes,
-         std::string_view dst_bytes) -> absl::Status {
+         std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     std::int16_t value;
     std::memcpy(&value, src_bytes.data(), sizeof(value));
     const float asFloat = static_cast<float>(value) * 10.0F;
     std::memcpy(WritableDestination(dst_bytes), &asFloat, sizeof(asFloat));
-    return absl::OkStatus();
+    return sizeof(asFloat);
   };
   auto status =
       mdio::TransformVariable(src.value(), dst.value(), std::move(toFloat))
@@ -756,11 +826,11 @@ TEST(TransformVariableTest, EmptyVariableTransformsToOk) {
   auto calls = std::make_shared<int>(0);
   mdio::ElementTransform counting =
       [calls](std::string_view src_bytes,
-              std::string_view dst_bytes) -> absl::Status {
+              std::string_view dst_bytes) -> absl::StatusOr<std::size_t> {
     ++(*calls);
     std::memcpy(WritableDestination(dst_bytes), src_bytes.data(),
                 src_bytes.size());
-    return absl::OkStatus();
+    return src_bytes.size();
   };
   auto status =
       mdio::TransformVariable(src.value(), dst.value(), std::move(counting))

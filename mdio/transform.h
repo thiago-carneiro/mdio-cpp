@@ -22,6 +22,7 @@
 
 #include "absl/functional/any_invocable.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "mdio/impl.h"
 #include "mdio/variable.h"
@@ -52,9 +53,13 @@ namespace mdio {
  *
  * @param src_bytes The source element, as raw bytes.
  * @param dst_bytes The destination element buffer, as raw bytes.
- * @return OkStatus, or an error that aborts the transfer.
+ * @return The number of bytes written to @p dst_bytes, which must equal
+ *     @c dst_bytes.size(); or an error that aborts the transfer. A reported
+ *     count that does not match the destination element size fails the
+ *     transfer with an error naming the destination variable, so a wrong
+ *     count cannot overflow or under-fill the destination buffer silently.
  */
-using ElementTransform = absl::AnyInvocable<absl::Status(
+using ElementTransform = absl::AnyInvocable<absl::StatusOr<std::size_t>(
     std::string_view src_bytes, std::string_view dst_bytes) const>;
 
 namespace internal {
@@ -167,27 +172,40 @@ inline absl::Status CheckTransformCompatibility(
  *
  * Elements are visited sequentially in row-major order. The first error
  * aborts the pass; the destination buffer may then hold partial output, but
- * TransformVariable never submits it to the store.
+ * TransformVariable never submits it to the store. The byte count each call
+ * reports is validated against the destination element size: a transform
+ * reporting a different count than the destination element holds would
+ * overflow or under-fill the buffer, so it fails the pass.
  *
  * @param src_data The flat source buffer (C-contiguous).
  * @param dst_data The flat destination buffer (C-contiguous).
  * @param src_layout The source element layout.
  * @param dst_layout The destination element layout.
+ * @param dst_name The destination variable name, for error messages.
  * @param fn The element transform.
- * @return OkStatus, or the first error from @p fn.
+ * @return OkStatus, or the first error: an error from @p fn, or the
+ *     byte-count contract violation above.
  */
 inline absl::Status ApplyElementTransform(const void* src_data, void* dst_data,
                                           const ElementLayout& src_layout,
                                           const ElementLayout& dst_layout,
+                                          const std::string& dst_name,
                                           const ElementTransform& fn) {
   const char* src_cursor = static_cast<const char*>(src_data);
   char* dst_cursor = static_cast<char*>(dst_data);
   for (std::size_t index = 0; index < src_layout.num_elements; ++index) {
-    absl::Status status =
+    absl::StatusOr<std::size_t> written =
         fn(std::string_view(src_cursor, src_layout.element_size),
            std::string_view(dst_cursor, dst_layout.element_size));
-    if (!status.ok()) {
-      return status;
+    if (!written.ok()) {
+      return written.status();
+    }
+    if (written.value() != dst_layout.element_size) {
+      return absl::InternalError(
+          absl::StrCat("The element transform for variable '", dst_name,
+                       "' reported writing ", written.value(),
+                       " bytes but the destination element holds ",
+                       dst_layout.element_size, " bytes."));
     }
     src_cursor += src_layout.element_size;
     dst_cursor += dst_layout.element_size;
@@ -220,10 +238,10 @@ inline void TransformAndWrite(
   auto dst_array = tensorstore::AllocateArray(
       dst.get_store().domain().box(), mdio::ContiguousLayoutOrder::c,
       tensorstore::value_init, dst.dtype());
-  absl::Status transformed =
-      ApplyElementTransform(src_array.byte_strided_origin_pointer().get(),
-                            dst_array.byte_strided_origin_pointer().get(),
-                            src_layout, dst_layout, fn);
+  absl::Status transformed = ApplyElementTransform(
+      src_array.byte_strided_origin_pointer().get(),
+      dst_array.byte_strided_origin_pointer().get(), src_layout, dst_layout,
+      dst.get_variable_name(), fn);
   if (!transformed.ok()) {
     // fn failed: no write is submitted, so dst keeps its prior contents.
     promise.SetResult(std::move(transformed));
@@ -278,11 +296,13 @@ inline void TransformAndWrite(
  *
  * @param src The source variable (read in full).
  * @param dst The destination variable (written in full).
- * @param fn The element transform, called once per element.
+ * @param fn The element transform, called once per element. Each call must
+ *     report the number of bytes it wrote, which must equal the destination
+ *     element size.
  * @return A future carrying OkStatus, or the first error: a validation error
  *     (rank, shape, or element count mismatch), a read error, the first
- *     @p fn error (in which case dst is not written at all), or the write's
- *     commit error.
+ *     @p fn error or byte-count contract violation (in which case dst is not
+ *     written at all), or the write's commit error.
  */
 inline Future<absl::Status> TransformVariable(const Variable<>& src,
                                               Variable<>& dst,
