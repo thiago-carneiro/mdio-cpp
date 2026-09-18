@@ -142,6 +142,34 @@ TEST(SummaryStatsTest, fromJsonMissing) {
   ASSERT_FALSE(statsRes.status().ok()) << statsRes.status();
 }
 
+TEST(SummaryStatsTest, fromJsonRejectsWrongTypedScalarFields) {
+  // Each scalar field with a wrong-typed value must be rejected with an
+  // error naming the field and the expected type, not an uncaught nlohmann
+  // exception escaping the open path.
+  const std::vector<std::pair<std::string, nlohmann::json>> wrongTyped = {
+      {"count", "100"},
+      {"max", {1.0, 2.0}},
+      {"min", nullptr},
+      {"sum", true},
+      {"sumSquares", "0.0"}};
+  for (const auto& [field, wrongValue] : wrongTyped) {
+    nlohmann::json expected = {
+        {"count", 100},
+        {"min", -1000.0},
+        {"max", 1000.0},
+        {"sum", 0.0},
+        {"sumSquares", 0.0},
+        {"histogram",
+         {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}};
+    expected[field] = wrongValue;
+    auto statsRes = mdio::internal::SummaryStats::FromJson(expected);
+    ASSERT_FALSE(statsRes.status().ok()) << field;
+    EXPECT_THAT(statsRes.status().message(), ::testing::HasSubstr(field));
+    EXPECT_THAT(statsRes.status().message(),
+                ::testing::HasSubstr("expected number"));
+  }
+}
+
 TEST(UserAttributesTest, fromJsonNoStats) {
   nlohmann::json expected = {{"attributes",
                               {{"foo", "bar"},
@@ -529,6 +557,51 @@ TEST(HistogramTest, fromJsonErrorPaths) {
   EXPECT_FALSE(edge.FromJson(edgeNoChild).status().ok());
 }
 
+TEST(HistogramTest, fromJsonRejectsWrongTypedFields) {
+  auto centered = mdio::internal::CenteredBinHistogram<float>({}, {});
+
+  // A non-array binCenters field.
+  nlohmann::json binCentersNotArray = {
+      {"histogram", {{"binCenters", "1.0, 2.0"}, {"counts", {1, 2}}}}};
+  auto res = centered.FromJson(binCentersNotArray);
+  ASSERT_FALSE(res.status().ok());
+  EXPECT_THAT(res.status().message(), ::testing::HasSubstr("binCenters"));
+  EXPECT_THAT(res.status().message(),
+              ::testing::HasSubstr("expected array of numbers"));
+
+  // A non-array counts field.
+  nlohmann::json countsNotArray = {
+      {"histogram", {{"binCenters", {1.0, 2.0}}, {"counts", 3}}}};
+  res = centered.FromJson(countsNotArray);
+  ASSERT_FALSE(res.status().ok());
+  EXPECT_THAT(res.status().message(), ::testing::HasSubstr("counts"));
+
+  // A non-number element inside binCenters.
+  nlohmann::json badElement = {
+      {"histogram", {{"binCenters", {1.0, "2.0"}}, {"counts", {1, 2}}}}};
+  res = centered.FromJson(badElement);
+  ASSERT_FALSE(res.status().ok());
+  EXPECT_THAT(res.status().message(), ::testing::HasSubstr("binCenters"));
+
+  auto edge = mdio::internal::EdgeDefinedHistogram<float>({}, {}, {});
+
+  // A non-array binWidths field.
+  nlohmann::json binWidthsNotArray = {
+      {"histogram",
+       {{"binEdges", {0.0, 1.0}}, {"binWidths", 1.0}, {"counts", {1}}}}};
+  res = edge.FromJson(binWidthsNotArray);
+  ASSERT_FALSE(res.status().ok());
+  EXPECT_THAT(res.status().message(), ::testing::HasSubstr("binWidths"));
+
+  // A non-number element inside counts.
+  nlohmann::json badCountElement = {
+      {"histogram",
+       {{"binEdges", {0.0, 1.0}}, {"binWidths", {1.0}}, {"counts", {1, "2"}}}}};
+  res = edge.FromJson(badCountElement);
+  ASSERT_FALSE(res.status().ok());
+  EXPECT_THAT(res.status().message(), ::testing::HasSubstr("counts"));
+}
+
 TEST(SummaryStatsTest, fromJsonEdgeHistogramAndMissingHistogram) {
   nlohmann::json edgeStats = {{"count", 50},
                               {"min", -500.0},
@@ -549,6 +622,26 @@ TEST(SummaryStatsTest, fromJsonEdgeHistogramAndMissingHistogram) {
                            {"sum", 50.0},
                            {"sumSquares", 500.0}};
   EXPECT_FALSE(mdio::internal::SummaryStats::FromJson(noHist).status().ok());
+}
+
+TEST(UserAttributesTest, fromJsonWrongTypedStatsV1NamesTheField) {
+  // The open path parses statsV1 through UserAttributes; a wrong-typed field
+  // must surface as an error naming the field, not a generic malformed-JSON
+  // message (or an uncaught exception for direct SummaryStats callers).
+  nlohmann::json expected = {
+      {"statsV1",
+       {{"count", "100"},
+        {"min", -1000.0},
+        {"max", 1000.0},
+        {"sum", 0.0},
+        {"sumSquares", 0.0},
+        {"histogram",
+         {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}}}};
+  auto attrsRes = mdio::UserAttributes::FromJson(expected);
+  ASSERT_FALSE(attrsRes.status().ok());
+  EXPECT_THAT(attrsRes.status().message(), ::testing::HasSubstr("count"));
+  EXPECT_THAT(attrsRes.status().message(),
+              ::testing::HasSubstr("expected number"));
 }
 
 TEST(UserAttributesTest, fromVariableJson) {
