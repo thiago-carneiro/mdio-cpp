@@ -436,7 +436,7 @@ programs are the starting point).
 
 *(Implemented, wave 1 — harness `8f45c52`; fix `067b3a5`+`e860b9c` — and
 the premise inverted a third time. Attribution (strace + tensorstore
-source, `.orquestra/pipeline/api-gap-plan-corrections-20260914/m7-attribution.md`):
+source, `docs/api-gap-plan-m7-attribution.md`):
 the entire measured cost was ONE recursive `kvstore::List` of the store,
 emitted by mdio's own v3 open path (`zarr_v3.h:580`) to discover
 variables — walking every directory and probing every file (the 6,137
@@ -544,7 +544,7 @@ Good first PRs, independent of the milestones:
 ## Robustness review (post-execution)
 
 Full adversarial review of `fcbfb85..d454e3c` (all waves): record at
-`.orquestra/pipeline/sdd/robustness-review-fcbfb85..d454e3c.md`. Verdict:
+`docs/api-gap-plan-robustness-review.md`. Verdict:
 merge with fixes. Fixed on `fix/api-gap-robustness` (all red-green
 verified — each test confirmed failing pre-fix):
 
