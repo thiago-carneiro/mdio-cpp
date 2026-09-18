@@ -84,6 +84,71 @@ namespace mdio {
 namespace internal {
 
 /**
+ * @brief Type-checks a scalar statsV1 field before conversion.
+ *
+ * nlohmann converts any JSON number to any arithmetic field type (by cast),
+ * but throws an uncaught type_error on anything else — and the exception
+ * escapes the open path for direct SummaryStats callers. Wrong-typed fields
+ * are rejected with a named error instead. Numbers keep converting exactly
+ * as before: this rejects only what nlohmann would throw on, so the
+ * accepted format is unchanged.
+ *
+ * @param value The JSON value of the field.
+ * @param context The error-message prefix naming what is being parsed.
+ * @param field The field name, for the error message.
+ * @return OkStatus, or InvalidArgumentError naming the field and the
+ *     expected vs. found type.
+ */
+inline absl::Status CheckScalarFieldType(const nlohmann::json& value,
+                                         const std::string& context,
+                                         const std::string& field) {
+  if (!value.is_number()) {
+    return absl::InvalidArgumentError(
+        context + "\n\tField '" + field +
+        "' has wrong type: expected number, got " +
+        std::string(value.type_name()));
+  }
+  return absl::OkStatus();
+}
+
+/**
+ * @brief Type-checks an array statsV1 field and its elements before
+ * conversion.
+ *
+ * Same contract as CheckScalarFieldType, for vector fields: nlohmann's
+ * implicit vector conversion throws on a non-array field or a non-number
+ * element; wrong-typed fields are rejected with a named error instead, and
+ * the accepted format is unchanged.
+ *
+ * @param value The JSON value of the field.
+ * @param context The error-message prefix naming what is being parsed.
+ * @param field The field name, for the error message.
+ * @return OkStatus, or InvalidArgumentError naming the field and the
+ *     expected vs. found type.
+ */
+inline absl::Status CheckArrayFieldType(const nlohmann::json& value,
+                                        const std::string& context,
+                                        const std::string& field) {
+  if (!value.is_array()) {
+    return absl::InvalidArgumentError(
+        context + "\n\tField '" + field +
+        "' has wrong type: expected array of numbers, got " +
+        std::string(value.type_name()));
+  }
+  std::size_t index = 0;
+  for (const auto& element : value) {
+    if (!element.is_number()) {
+      return absl::InvalidArgumentError(
+          context + "\n\tField '" + field +
+          "' has wrong type: expected array of numbers, but element " +
+          std::to_string(index) + " is " + std::string(element.type_name()));
+    }
+    ++index;
+  }
+  return absl::OkStatus();
+}
+
+/**
  * @brief A Histogram can be either CenteredBinHistogram or EdgeDefinedHistogram
  * as defined by the MDIO spec
  */
@@ -129,6 +194,17 @@ class CenteredBinHistogram : public Histogram {
     if (isHist(j)) {
       auto histogram = j[HIST_KEY];
       if (histogram.contains("binCenters") && histogram.contains("counts")) {
+        // Type-check before converting: nlohmann's implicit vector
+        // conversion throws an uncaught exception on a non-array field or a
+        // non-number element, which escapes the open path.
+        const std::string context =
+            "Error parsing histogram:\n\tType detected: CenteredBinHistogram";
+        for (const auto& field : {"binCenters", "counts"}) {
+          auto status = CheckArrayFieldType(histogram[field], context, field);
+          if (!status.ok()) {
+            return status;
+          }
+        }
         std::vector<T> binCenters = j[HIST_KEY]["binCenters"];
         std::vector<int32_t> counts = j[HIST_KEY]["counts"];
         auto hist =
@@ -192,6 +268,17 @@ class EdgeDefinedHistogram : public Histogram {
       auto histogram = j[HIST_KEY];
       if (histogram.contains("binEdges") && histogram.contains("binWidths") &&
           histogram.contains("counts")) {
+        // Type-check before converting: nlohmann's implicit vector
+        // conversion throws an uncaught exception on a non-array field or a
+        // non-number element, which escapes the open path.
+        const std::string context =
+            "Error parsing histogram:\n\tType detected: EdgeDefinedHistogram";
+        for (const auto& field : {"binEdges", "binWidths", "counts"}) {
+          auto status = CheckArrayFieldType(histogram[field], context, field);
+          if (!status.ok()) {
+            return status;
+          }
+        }
         std::vector<T> binEdges = j[HIST_KEY]["binEdges"];
         std::vector<T> binWidths = j[HIST_KEY]["binWidths"];
         std::vector<int32_t> counts = j[HIST_KEY]["counts"];
@@ -314,6 +401,14 @@ class SummaryStats {
       if (!j.contains(key)) {
         return absl::InvalidArgumentError(
             "Error parsing statsV1:\n\tMissing key: '" + key + "'");
+      }
+    }
+    // Type-check before converting: get<int32_t>/get<float> throw an
+    // uncaught exception on a non-number, which escapes the open path.
+    for (const auto& key : keys) {
+      auto status = CheckScalarFieldType(j[key], "Error parsing statsV1:", key);
+      if (!status.ok()) {
+        return status;
       }
     }
     auto stats =
