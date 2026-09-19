@@ -572,3 +572,33 @@ statsV1); `ElementTransform` byte-count contract enforcement
 in user-facing docs (externally added variables are invisible to
 index-based opens, and `CommitMetadata` regenerates the index without
 them).
+
+## Author email rewrite (2026-09-18)
+
+All 47 commits on `main` above `upstream/main` (and every branch tip
+inside that range) were rewritten to replace the author/committer email
+`thiago.carneiro@petrobras.com.br` with `thiagopc@gmail.com` — the
+GitHub-verified email of the personal account that owns the fork and
+opens the upstream PRs. Trees, messages, author/committer names and
+dates are unchanged (verified: empty content diff, identical per-branch
+counts).
+
+**Hash references in this document predate the rewrite.** The full
+pre-rewrite lineage is preserved under `refs/original/refs/heads/main`
+(every old hash cited here resolves there). Key mappings:
+
+| Old | New | Subject |
+| --- | --- | --- |
+| `1bdbc00` | `afacdbc` | Add Dataset::to_json |
+| `9818db5` | `506ca24` | Ungate struct-array round-trip coverage |
+| `66d6f50` | `bcf4758` | Reject wrong-typed statsV1 fields |
+| `1bd71b1` | `f5d17b0` | Enforce element transform byte-count contract |
+| `e383b6a` | `18e2c9b` | docs: variable index semantics |
+| `0cf09f2` | `d9ed2e1` | Merge origin/main (docs #175) — main tip |
+
+Upstream history is byte-untouched: the merge-base with `upstream/main`
+remains `dd36d06`, and the 128 GPG-signed upstream commits keep their
+hashes (a first attempt that rewrote the full history severed the
+merge-base by dropping `gpgsig` headers on re-commit; it was rolled back
+from the `refs/original` backups and redone on the
+`upstream/main..main` range only).
