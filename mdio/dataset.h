@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -29,6 +31,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -205,6 +208,382 @@ inline void WarnOnMissingDatasetMetadata(const ::nlohmann::json& metadata,
       << absl::StrJoin(missing, ", ")
       << ". Continuing without them; these fields are informational and do "
          "not affect how the dataset is read.";
+}
+
+// ==========================================================================
+// Creation-JSON serialization helpers (Dataset::to_json)
+// ==========================================================================
+
+/**
+ * @brief Reverse of zarr::v2::ToZarrDtype: maps a numpy-style dtype string to
+ * the MDIO scalar name.
+ *
+ * One-byte dtypes accept both the "<" and "|" byte-order prefixes (numpy
+ * emits "|" for types that carry no endianness).
+ * @param dtype The numpy-style dtype string (e.g. "<i4").
+ * @return The MDIO scalar name (e.g. "int32"), or InvalidArgumentError for an
+ * unknown dtype.
+ */
+inline Result<std::string> FromZarrV2Dtype(const std::string& dtype) {
+  if (dtype == "<i1" || dtype == "|i1") return "int8";
+  if (dtype == "<i2") return "int16";
+  if (dtype == "<i4") return "int32";
+  if (dtype == "<i8") return "int64";
+  if (dtype == "<u1" || dtype == "|u1") return "uint8";
+  if (dtype == "<u2") return "uint16";
+  if (dtype == "<u4") return "uint32";
+  if (dtype == "<u8") return "uint64";
+  if (dtype == "<f2") return "float16";
+  if (dtype == "<f4") return "float32";
+  if (dtype == "<f8") return "float64";
+  if (dtype == "|b1") return "bool";
+  if (dtype == "<c8") return "complex64";
+  if (dtype == "<c16") return "complex128";
+  return absl::InvalidArgumentError("Unknown Zarr V2 dtype: " + dtype);
+}
+
+/**
+ * @brief Reads the stored user attributes of a Variable from its kvstore.
+ *
+ * V2 stores keep them in "<variable>/.zattrs" and V3 stores in
+ * "<variable>/zarr.json" under "attributes". The stored form is authoritative
+ * for "statsV1"/"unitsV1"/"attributes" because the in-memory UserAttributes
+ * flatten unitsV1 objects (e.g. {"speed": "m/s"} becomes "m/s"), a form the
+ * creation schema rejects.
+ * @param var The Variable to read from.
+ * @param version The Zarr version of the underlying store.
+ * @return The stored attributes object; a missing attribute file yields an
+ * empty object. Read and parse errors are propagated.
+ */
+inline Result<nlohmann::json> ReadStoredAttributes(
+    const Variable<>& var, const zarr::ZarrVersion version) {
+  const tensorstore::KvStore kvstore = var.get_store().kvstore();
+  // The store's kvstore path keeps its trailing slash on local file systems;
+  // joining it with a leading-slash key would form an invalid "//" path.
+  const char* attribute_file =
+      version == zarr::ZarrVersion::kV3 ? "zarr.json" : ".zattrs";
+  const std::string separator =
+      kvstore.path.empty() || kvstore.path.back() == '/' ? "" : "/";
+  auto read_result =
+      tensorstore::kvstore::Read(kvstore, separator + attribute_file).result();
+  if (!read_result.ok()) {
+    return read_result.status();
+  }
+  if (!read_result->has_value()) {
+    return nlohmann::json::object();
+  }
+  const auto parsed =
+      nlohmann::json::parse(std::string(read_result->value), nullptr, false);
+  if (parsed.is_discarded()) {
+    return absl::InvalidArgumentError(
+        "Failed to parse stored attributes of variable '" +
+        var.get_variable_name() + "'.");
+  }
+  if (version == zarr::ZarrVersion::kV3) {
+    if (!parsed.contains("attributes")) {
+      return nlohmann::json::object();
+    }
+    return parsed.at("attributes");
+  }
+  return parsed;
+}
+
+/**
+ * @brief Builds the creation-schema struct fields from a V2 numpy-style dtype
+ * array (e.g. [["cdp-x", "<i4"], ["cdp-y", "<i4"]]).
+ */
+inline Result<nlohmann::json> StructFieldsFromV2Dtype(
+    const nlohmann::json& dtype, const std::string& variable_name) {
+  nlohmann::json fields = nlohmann::json::array();
+  for (const nlohmann::json& pair : dtype) {
+    if (!pair.is_array() || pair.size() != 2 || !pair.at(0).is_string() ||
+        !pair.at(1).is_string()) {
+      return absl::InvalidArgumentError(
+          "Variable '" + variable_name +
+          "' has a malformed V2 struct dtype entry.");
+    }
+    MDIO_ASSIGN_OR_RETURN(const std::string format,
+                          FromZarrV2Dtype(pair.at(1).get<std::string>()));
+    fields.push_back({{"name", pair.at(0)}, {"format", format}});
+  }
+  return nlohmann::json{{"fields", fields}};
+}
+
+/**
+ * @brief Builds the creation-schema struct fields from a V3 data_type
+ * descriptor ({"name": "struct", "configuration": {"fields": [...]}}).
+ */
+inline Result<nlohmann::json> StructFieldsFromV3DataType(
+    const nlohmann::json& data_type, const std::string& variable_name) {
+  if (!data_type.is_object() || !data_type.contains("configuration") ||
+      !data_type.at("configuration").contains("fields")) {
+    return absl::InvalidArgumentError(
+        "Variable '" + variable_name +
+        "' has an unsupported V3 data_type layout.");
+  }
+  nlohmann::json fields = nlohmann::json::array();
+  for (const nlohmann::json& field :
+       data_type.at("configuration").at("fields")) {
+    if (!field.contains("name") || !field.contains("data_type")) {
+      return absl::InvalidArgumentError(
+          "Variable '" + variable_name +
+          "' has a struct field without a name or data_type.");
+    }
+    fields.push_back(
+        {{"name", field.at("name")}, {"format", field.at("data_type")}});
+  }
+  return nlohmann::json{{"fields", fields}};
+}
+
+/**
+ * @brief Builds the creation-schema "dataType" from a Variable's zarr spec.
+ *
+ * Scalars map through the zarr dtype metadata (V2 numpy-style strings, V3
+ * MDIO names). Structured arrays translate their per-field layout into the
+ * schema's {"fields": [{"name", "format"}]} form. The top-level spec "dtype"
+ * is deliberately not used: for structured arrays it is the byte view
+ * ("byte"), which the creation schema rejects.
+ * @param spec The Variable's zarr spec (from Variable::spec()).
+ * @param version The Zarr version of the underlying store.
+ * @param variable_name The Variable name, for error context.
+ * @return The creation-schema dataType (a scalar name or a fields object), or
+ * InvalidArgumentError for an unsupported layout.
+ */
+inline Result<nlohmann::json> DataTypeFromSpec(
+    const nlohmann::json& spec, const zarr::ZarrVersion version,
+    const std::string& variable_name) {
+  const nlohmann::json& metadata = spec.at("metadata");
+  if (version == zarr::ZarrVersion::kV3) {
+    const nlohmann::json& data_type = metadata.at("data_type");
+    if (data_type.is_string()) {
+      return data_type;
+    }
+    return StructFieldsFromV3DataType(data_type, variable_name);
+  }
+  const nlohmann::json& dtype = metadata.at("dtype");
+  if (dtype.is_string()) {
+    return FromZarrV2Dtype(dtype.get<std::string>());
+  }
+  if (dtype.is_array()) {
+    return StructFieldsFromV2Dtype(dtype, variable_name);
+  }
+  return absl::InvalidArgumentError("Variable '" + variable_name +
+                                    "' has an unsupported V2 dtype.");
+}
+
+/**
+ * @brief Builds the creation-schema Blosc compressor from a zarr Blosc
+ * configuration.
+ *
+ * The V2 (numcodecs) integer shuffle form is translated to the schema's
+ * string enum; the V3 form already uses the string enum and passes through.
+ * @param config The Blosc configuration (cname, clevel, shuffle, blocksize,
+ * optional typesize).
+ * @param variable_name The Variable name, for error context.
+ * @return The creation-schema compressor object, or InvalidArgumentError when
+ * a required key is missing.
+ */
+inline Result<nlohmann::json> BloscCompressorFromConfig(
+    const nlohmann::json& config, const std::string& variable_name) {
+  for (const auto* key : {"cname", "clevel", "shuffle", "blocksize"}) {
+    if (!config.contains(key)) {
+      return absl::InvalidArgumentError("Blosc configuration of variable '" +
+                                        variable_name + "' is missing key '" +
+                                        key + "'.");
+    }
+  }
+  nlohmann::json compressor = {
+      {"name", "blosc"},
+      {"cname", config.at("cname")},
+      {"clevel", config.at("clevel")},
+      {"shuffle", blosc_shuffle_to_string(config.at("shuffle"))},
+      {"blocksize", config.at("blocksize")}};
+  if (config.contains("typesize")) {
+    compressor["typesize"] = config.at("typesize");
+  }
+  return compressor;
+}
+
+/**
+ * @brief Builds the creation-schema "compressor" from a Variable's zarr spec.
+ *
+ * V2 stores express compression as metadata.compressor (numcodecs form, null
+ * when uncompressed); V3 stores as a metadata.codecs pipeline ([bytes] alone
+ * means uncompressed, [bytes, blosc] means Blosc). Only Blosc is supported by
+ * the creation path (transform_compressor), so any other codec is reported
+ * instead of being silently dropped.
+ * @param spec The Variable's zarr spec (from Variable::spec()).
+ * @param version The Zarr version of the underlying store.
+ * @param variable_name The Variable name, for error context.
+ * @return The creation-schema compressor object, null when the Variable is
+ * uncompressed, or InvalidArgumentError for an unsupported codec.
+ */
+inline Result<nlohmann::json> CompressorFromSpec(
+    const nlohmann::json& spec, const zarr::ZarrVersion version,
+    const std::string& variable_name) {
+  const nlohmann::json& metadata = spec.at("metadata");
+  if (version == zarr::ZarrVersion::kV3) {
+    if (!metadata.contains("codecs")) {
+      return absl::InvalidArgumentError("Variable '" + variable_name +
+                                        "' has no codecs pipeline.");
+    }
+    for (const nlohmann::json& codec : metadata.at("codecs")) {
+      if (!codec.is_object() || !codec.contains("name")) {
+        return absl::InvalidArgumentError("Variable '" + variable_name +
+                                          "' has a malformed codec.");
+      }
+      if (codec.at("name") == "bytes") {
+        continue;  // Endianness codec, always present.
+      }
+      if (codec.at("name") != "blosc") {
+        return absl::InvalidArgumentError(
+            "Variable '" + variable_name + "' uses codec '" +
+            codec.at("name").get<std::string>() +
+            "', which the creation schema does not support.");
+      }
+      if (!codec.contains("configuration")) {
+        return absl::InvalidArgumentError(
+            "Variable '" + variable_name +
+            "' has a blosc codec without configuration.");
+      }
+      return BloscCompressorFromConfig(codec.at("configuration"),
+                                       variable_name);
+    }
+    return nlohmann::json();  // [bytes] only: uncompressed.
+  }
+  if (!metadata.contains("compressor") || metadata.at("compressor").is_null()) {
+    return nlohmann::json();  // Uncompressed.
+  }
+  const nlohmann::json& compressor = metadata.at("compressor");
+  if (!compressor.contains("id") || compressor.at("id") != "blosc") {
+    return absl::InvalidArgumentError("Variable '" + variable_name +
+                                      "' uses a compressor the creation "
+                                      "schema does not support.");
+  }
+  return BloscCompressorFromConfig(compressor, variable_name);
+}
+
+/**
+ * @brief Reads the chunk grid name from a Variable's zarr spec.
+ *
+ * V3 specs carry it in metadata.chunk_grid.name; V2 "chunks" arrays are
+ * regular grids by definition, so "regular" is returned for them.
+ */
+inline std::string ChunkGridNameFromSpec(const nlohmann::json& spec,
+                                         const zarr::ZarrVersion version) {
+  if (version == zarr::ZarrVersion::kV3) {
+    const nlohmann::json& metadata = spec.at("metadata");
+    if (metadata.contains("chunk_grid") &&
+        metadata.at("chunk_grid").contains("name")) {
+      return metadata.at("chunk_grid").at("name").get<std::string>();
+    }
+  }
+  return "regular";
+}
+
+/**
+ * @brief Builds the creation-schema "dimensions" for a Variable.
+ *
+ * Dimension coordinates (rank 1, name matching the dimension label) use the
+ * object form [{"name", "size"}] so the create path registers the dimension;
+ * every other variable uses the string form. The trailing unlabeled byte axis
+ * of structured arrays is not part of the logical schema and is dropped.
+ * @param var The Variable to serialize.
+ * @return The creation-schema dimensions entry, or InvalidArgumentError when
+ * a dimension is unlabeled in a way the schema cannot express.
+ */
+inline Result<nlohmann::json> DimensionsFromVariable(const Variable<>& var) {
+  const std::string& name = var.get_variable_name();
+  auto dimensions_view = var.dimensions();
+  std::vector<std::string_view> labels(dimensions_view.labels().begin(),
+                                       dimensions_view.labels().end());
+  std::vector<tensorstore::Index> shape(dimensions_view.shape().begin(),
+                                        dimensions_view.shape().end());
+  // Drop the trailing byte axis of structured arrays (unlabeled).
+  while (!labels.empty() && labels.back().empty()) {
+    labels.pop_back();
+    shape.pop_back();
+  }
+  for (const std::string_view& label : labels) {
+    if (label.empty()) {
+      return absl::InvalidArgumentError(
+          "Variable '" + name +
+          "' has an unlabeled dimension that is not "
+          "the trailing byte axis; the creation schema cannot express it.");
+    }
+  }
+  if (labels.size() == 1 && labels.front() == name) {
+    // Dimension coordinate: the object form registers name and size.
+    nlohmann::json dimension = {{"name", name}, {"size", shape.front()}};
+    return nlohmann::json::array({dimension});
+  }
+  return nlohmann::json(std::vector<std::string>(labels.begin(), labels.end()));
+}
+
+/**
+ * @brief Serializes one Variable into a creation-schema variable entry.
+ *
+ * The zarr spec supplies the dataType, dimensions and chunk grid; the stored
+ * attributes ("statsV1"/"unitsV1"/"attributes") are read from the kvstore
+ * because the in-memory forms flatten unitsV1 objects (see
+ * ReadStoredAttributes).
+ * @param var The Variable to serialize.
+ * @param coordinates The non-dimension coordinate names of the Variable.
+ * @param defaults Whether to include default values in the spec
+ * serialization.
+ * @return The creation-schema variable entry, or an error.
+ */
+inline Result<nlohmann::json> VariableToCreationJson(
+    const Variable<>& var, const std::vector<std::string>& coordinates,
+    const IncludeDefaults defaults) {
+  const std::string& name = var.get_variable_name();
+
+  auto spec_result = var.spec();
+  if (!spec_result.ok()) {
+    return spec_result.status();
+  }
+  auto json_result = spec_result.value().ToJson(defaults);
+  if (!json_result.ok()) {
+    return json_result.status();
+  }
+  const nlohmann::json spec = json_result.value();
+  const zarr::ZarrVersion version = zarr::GetVersionFromSpec(spec);
+
+  nlohmann::json entry;
+  entry["name"] = name;
+  MDIO_ASSIGN_OR_RETURN(entry["dataType"],
+                        DataTypeFromSpec(spec, version, name));
+  MDIO_ASSIGN_OR_RETURN(entry["dimensions"], DimensionsFromVariable(var));
+
+  if (!var.get_long_name().empty()) {
+    entry["longName"] = var.get_long_name();
+  }
+
+  MDIO_ASSIGN_OR_RETURN(const nlohmann::json compressor,
+                        CompressorFromSpec(spec, version, name));
+  if (!compressor.is_null()) {
+    entry["compressor"] = compressor;
+  }
+
+  nlohmann::json metadata_block;
+  MDIO_ASSIGN_OR_RETURN(const auto chunk_shape, var.get_chunk_shape());
+  metadata_block["chunkGrid"] = {
+      {"name", ChunkGridNameFromSpec(spec, version)},
+      {"configuration", {{"chunkShape", chunk_shape}}}};
+  MDIO_ASSIGN_OR_RETURN(const nlohmann::json stored_attributes,
+                        ReadStoredAttributes(var, version));
+  for (const auto* attribute_key : {"statsV1", "unitsV1", "attributes"}) {
+    if (stored_attributes.contains(attribute_key) &&
+        !stored_attributes.at(attribute_key).is_null()) {
+      metadata_block[attribute_key] = stored_attributes.at(attribute_key);
+    }
+  }
+  entry["metadata"] = metadata_block;
+
+  if (!coordinates.empty()) {
+    entry["coordinates"] = coordinates;
+  }
+  return entry;
 }
 }  // namespace internal
 
@@ -448,6 +827,9 @@ class Dataset {
    * );
    * @endcode
    *
+   * @note The descriptor start/stop are domain indices, not coordinate
+   * values. To select by coordinate value, use `sel`.
+   *
    * @return An `mdio::Result` containing a sliced Dataset if successful, or an
    * error if the slice is invalid.
    */
@@ -576,9 +958,183 @@ class Dataset {
     return current;
   }
 
+  /// The order of a 1-D coordinate axis. Internal use only.
+  enum class CoordinateOrder {
+    /// Non-decreasing values (ties allowed).
+    kAscending,
+    /// Non-increasing values (ties allowed).
+    kDescending,
+    /// Neither of the above; range endpoints must match exactly.
+    kUnordered,
+  };
+
+  /**
+   * @brief Internal use only.
+   * Classifies the order of a 1-D coordinate axis.
+   * @param coords The coordinate values in index order.
+   * @return kAscending, kDescending, or kUnordered.
+   */
+  template <typename ValueType>
+  static CoordinateOrder classify_coordinate_order(
+      const std::vector<ValueType>& coords) {
+    if (std::is_sorted(coords.begin(), coords.end())) {
+      return CoordinateOrder::kAscending;
+    }
+    if (std::is_sorted(coords.begin(), coords.end(),
+                       std::greater<ValueType>())) {
+      return CoordinateOrder::kDescending;
+    }
+    return CoordinateOrder::kUnordered;
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves a range endpoint against a monotonic coordinate axis to the
+   * index of the nearest contained value, mirroring xarray/pandas
+   * label-based slicing:
+   * - ascending start: first value >= bound
+   * - ascending stop: last value <= bound
+   * - descending start: first value <= bound
+   * - descending stop: last value >= bound
+   * A bound with no contained value (entirely outside the axis) is an
+   * error rather than a clamp.
+   * @param order The axis order; must not be kUnordered.
+   * @param is_start True for the start endpoint, false for the stop.
+   * @param coords The monotonic coordinate values in index order.
+   * @param bound The endpoint value from the descriptor.
+   * @return The index of the nearest contained value.
+   */
+  template <typename ValueType>
+  static Result<Index> nearest_contained_index(
+      const CoordinateOrder order, const bool is_start,
+      const std::vector<ValueType>& coords, const ValueType bound) {
+    if (is_start) {
+      const auto it =
+          order == CoordinateOrder::kAscending
+              ? std::lower_bound(coords.begin(), coords.end(), bound)
+              : std::lower_bound(coords.begin(), coords.end(), bound,
+                                 std::greater<ValueType>());
+      if (it == coords.end()) {
+        return absl::InvalidArgumentError("Start value not found.");
+      }
+      return static_cast<Index>(it - coords.begin());
+    }
+    const auto it = order == CoordinateOrder::kAscending
+                        ? std::upper_bound(coords.begin(), coords.end(), bound)
+                        : std::upper_bound(coords.begin(), coords.end(), bound,
+                                           std::greater<ValueType>());
+    if (it == coords.begin()) {
+      return absl::InvalidArgumentError("Stop value not found.");
+    }
+    return static_cast<Index>(it - coords.begin() - 1);
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves range endpoints against an unordered coordinate axis.
+   * Unordered axes cannot snap to a nearest contained value, so both
+   * endpoints must match a coordinate exactly, and each endpoint value
+   * must be unique on the axis. A start endpoint resolving after the
+   * stop endpoint is not supported.
+   * @param coords The coordinate values in index order.
+   * @param descriptor The value-typed range descriptor.
+   * @param out_endpoints Receives the {start, stop} indices into coords.
+   */
+  template <typename ValueType>
+  static absl::Status resolve_exact_endpoints(
+      const std::vector<ValueType>& coords,
+      const RangeDescriptor<ValueType>& descriptor,
+      std::pair<Index, Index>& out_endpoints) {
+    std::pair<bool, Index> start = {false, 0};
+    std::pair<bool, Index> stop = {false, 0};
+    for (size_t i = 0; i < coords.size(); ++i) {
+      if (coords[i] == descriptor.start) {
+        if (start.first) {
+          return absl::InvalidArgumentError("Repeated start value.");
+        }
+        start = {true, static_cast<Index>(i)};
+      }
+      if (coords[i] == descriptor.stop) {
+        if (stop.first) {
+          return absl::InvalidArgumentError("Repeated stop value.");
+        }
+        stop = {true, static_cast<Index>(i)};
+      }
+    }
+    if (!start.first) {
+      return absl::InvalidArgumentError("Start value not found.");
+    }
+    if (!stop.first) {
+      return absl::InvalidArgumentError("Stop value not found.");
+    }
+    if (start.second > stop.second) {
+      return absl::UnimplementedError(
+          "Start value happens after stop value. This is not a supported "
+          "case.");
+    }
+    out_endpoints = {start.second, stop.second};
+    return absl::OkStatus();
+  }
+
+  /**
+   * @brief Internal use only.
+   * Resolves the endpoints of a range selection to coordinate indices.
+   * Monotonic coordinates snap each endpoint to the nearest contained
+   * value (xarray/pandas label-slicing semantics); unordered coordinates
+   * require exact, unique endpoints. A start index after the stop index
+   * is not supported.
+   * @param label The label of the coordinate axis being selected (used in
+   * error messages).
+   * @param coords The coordinate values in index order.
+   * @param descriptor The value-typed range descriptor.
+   * @param out_endpoints Receives the {start, stop} indices into coords.
+   */
+  template <typename ValueType>
+  static absl::Status resolve_range_endpoints(
+      const std::string_view label, const std::vector<ValueType>& coords,
+      const RangeDescriptor<ValueType>& descriptor,
+      std::pair<Index, Index>& out_endpoints) {
+    // A NaN on a floating-point axis corrupts everything downstream of
+    // here: the order classification is NaN-blind (std::is_sorted treats
+    // [1, 2, NaN, 4] as ascending) and the endpoint binary searches
+    // resolve bounds onto the NaN position, silently mis-anchoring the
+    // selection. A NaN-containing axis is corrupt; error loudly instead.
+    if constexpr (std::is_floating_point_v<ValueType>) {
+      if (std::any_of(coords.begin(), coords.end(),
+                      [](const ValueType value) {
+                        return std::isnan(value);
+                      })) {
+        return absl::InvalidArgumentError(
+            "Coordinate axis '" + std::string(label) +
+            "' contains NaN; range selection is not supported.");
+      }
+    }
+    const CoordinateOrder order = classify_coordinate_order(coords);
+    if (order == CoordinateOrder::kUnordered) {
+      return resolve_exact_endpoints(coords, descriptor, out_endpoints);
+    }
+    MDIO_ASSIGN_OR_RETURN(
+        const Index startIndex,
+        nearest_contained_index(order, true, coords, descriptor.start));
+    MDIO_ASSIGN_OR_RETURN(
+        const Index stopIndex,
+        nearest_contained_index(order, false, coords, descriptor.stop));
+    if (startIndex > stopIndex) {
+      return absl::UnimplementedError(
+          "Start value happens after stop value. This is not a supported "
+          "case.");
+    }
+    out_endpoints = {startIndex, stopIndex};
+    return absl::OkStatus();
+  }
+
   /**
    * @brief Internal use only.
    * Converts the `sel` descriptors to their `isel` equivalents.
+   * For `ValueDescriptor` and `ListDescriptor`, each label maps to the
+   * indices of every occurrence of the requested values. For
+   * `RangeDescriptor`, each label maps to the resolved
+   * {start_index, stop_index} pair of the range endpoints.
    */
   template <typename... Descriptors>
   Result<std::map<std::string_view, std::vector<Index>>> descriptor_to_index(
@@ -610,8 +1166,35 @@ class Dataset {
       auto offset = varDat.get_flattened_offset();
       if constexpr ((std::is_same_v<
                          Descriptors,
-                         ListDescriptor<typename Descriptors::type>> &&
+                         RangeDescriptor<typename Descriptors::type>> &&
                      ...)) {
+        if (descriptor.start == descriptor.stop) {
+          trueStatus = absl::InvalidArgumentError(
+              "Start and stop values must be different.");
+          return trueStatus;
+        }
+
+        std::vector<ValueType> coords;
+        coords.reserve(var.num_samples());
+        for (Index i = offset; i < var.num_samples() + offset; ++i) {
+          coords.push_back(varAccessor({i}));
+        }
+
+        std::pair<Index, Index> endpoints;
+        trueStatus = resolve_range_endpoints(descriptor.label.label(), coords,
+                                             descriptor, endpoints);
+        if (!trueStatus.ok()) {
+          return trueStatus;
+        }
+
+        // Store the resolved {start, stop} pair (offset-based, like the
+        // Value/List paths) for `sel` to convert into an `isel` range.
+        label_to_indices[descriptor.label.label()] = {
+            endpoints.first + offset, endpoints.second + offset};
+      } else if constexpr ((std::is_same_v<
+                                Descriptors,
+                                ListDescriptor<typename Descriptors::type>> &&
+                            ...)) {
         std::set<ValueType> values;
         for (auto val : descriptor.values) {
           if (values.count(val) > 0) {
@@ -666,6 +1249,8 @@ class Dataset {
    * descriptors provided.
    * @param descriptors The descriptors to use for the slice. May be
    * `RangeDescriptor`, `ValueDescriptor`, or `ListDescriptor`.
+   * @note Descriptor values are coordinate values, not domain indices; use
+   * `isel` to select by domain index.
    */
   template <typename... Descriptors>
   Result<Dataset> sel(Descriptors... descriptors) {
@@ -703,24 +1288,8 @@ class Dataset {
           "All descriptors must be of the same type.");
     }
 
-    // Validate each descriptor (for example, ListDescriptor not yet supported)
+    // Validate each descriptor
     auto validateDescriptors = [this](auto& descriptor) {
-      using DescriptorType = typename outer_type<decltype(descriptor)>::type;
-      if constexpr (std::is_same_v<
-                        std::remove_reference_t<DescriptorType>,
-                        ListDescriptor<typename std::remove_reference_t<
-                            decltype(descriptor)>::type>>) {
-        return absl::UnimplementedError(
-            "Support for ListDescriptor is not yet implemented.");
-      }
-      // TODO(BrianMichell): Remove this check when SliceDescriptor is removed
-      if constexpr (std::is_same_v<DescriptorType, SliceDescriptor>) {
-        return absl::InvalidArgumentError(
-            "SliceDescriptor is deprecated and will be removed in future "
-            "versions. Please use RangeDescriptor instead.\nThe sel method "
-            "does not support SliceDescriptor.");
-      }
-
       MDIO_ASSIGN_OR_RETURN(
           auto var, variables.at(std::string(descriptor.label.label())));
       if (var.dimensions().rank() != 1) {
@@ -816,94 +1385,21 @@ class Dataset {
       return isel(
           static_cast<const std::vector<RangeDescriptor<Index>>&>(slices));
     } else {
-      std::map<std::string_view, std::pair<Index, Index>>
-          label_to_range;  // pair.first = start, pair.second = stop
-      absl::Status trueStatus =
-          absl::OkStatus();  // A hack to allow for true error status return.
-
-      auto processDescriptor = [this, &label_to_range,
-                                &trueStatus](auto& descriptor) -> absl::Status {
-        using ValueType =
-            typename extract_descriptor_Ttype<decltype(descriptor)>::type;
-
-        if (descriptor.start == descriptor.stop) {
-          trueStatus = absl::InvalidArgumentError(
-              "Start and stop values must be different.");
-          return trueStatus;
-        }
-
-        auto varRes =
-            variables.get<ValueType>(std::string(descriptor.label.label()));
-        if (!varRes.status().ok()) {
-          trueStatus = varRes.status();
-          return trueStatus;
-        }
-        auto var = varRes.value();
-        auto varFut = var.Read();
-        if (!varFut.status().ok()) {
-          trueStatus = varFut.status();
-          return trueStatus;
-        }
-        auto varDat = varFut.value();
-        auto varAccessor = varDat.get_data_accessor();
-
-        std::pair<bool, Index> start = {false, 0};
-        std::pair<bool, Index> stop = {false, 0};
-        auto offset = varDat.get_flattened_offset();
-
-        for (Index i = offset; i < var.num_samples() + offset; i++) {
-          if (varAccessor({i}) == descriptor.start) {
-            if (start.first) {
-              trueStatus = absl::InvalidArgumentError("Repeated start value.");
-              return trueStatus;
-            }
-            start = {true, i};
-          }
-          if (varAccessor({i}) == descriptor.stop) {
-            if (stop.first) {
-              trueStatus = absl::InvalidArgumentError("Repeated stop value.");
-              return trueStatus;
-            }
-            stop = {true, i};
-          }
-        }
-
-        if (!start.first) {
-          trueStatus = absl::InvalidArgumentError("Start value not found.");
-          return trueStatus;
-        }
-        if (!stop.first) {
-          trueStatus = absl::InvalidArgumentError("Stop value not found.");
-          return trueStatus;
-        }
-
-        // Xarray behavior is to effectively remove the Variable in this case.
-        if (start.second >= stop.second) {
-          trueStatus = absl::UnimplementedError(
-              "Start value happens after stop value. This is not a supported "
-              "case.");
-          return trueStatus;
-        }
-        // This case should be caught by the earlier check, but it's here for
-        // completeness.
-        if (label_to_range.count(descriptor.label.label()) > 0) {
-          trueStatus =
-              absl::InvalidArgumentError("Label must not be repeated.");
-          return trueStatus;
-        }
-        label_to_range[descriptor.label.label()] = {start.second, stop.second};
-        return absl::OkStatus();
-      };
-
-      auto status = (processDescriptor(descriptors).ok() && ...);
-      if (!status) {
-        return trueStatus;
+      // RangeDescriptor: `descriptor_to_index` resolves each endpoint to
+      // the nearest contained coordinate value (monotonic axes) or to an
+      // exact, unique match (unordered axes).
+      auto slicer = descriptor_to_index(descriptors...);
+      if (!slicer.status().ok()) {
+        return slicer.status();
       }
 
+      auto label_to_indices = slicer.value();
+
+      // Each entry holds the resolved {start_index, stop_index} pair.
       std::vector<RangeDescriptor<Index>> slices;
-      for (auto& elem : label_to_range) {
+      for (auto& elem : label_to_indices) {
         slices.emplace_back(RangeDescriptor<Index>(
-            {elem.first, elem.second.first, elem.second.second + 1, 1}));
+            {elem.first, elem.second.front(), elem.second.back() + 1, 1}));
       }
 
       if (slices.empty()) {
@@ -1456,6 +1952,71 @@ class Dataset {
    * @return A const reference to the Dataset's metadata.
    */
   const nlohmann::json& getMetadata() const { return metadata; }
+
+  /**
+   * @brief Serializes the Dataset into the creation JSON consumed by
+   * from_json().
+   * @details \b Usage
+   * @code
+   *  MDIO_ASSIGN_OR_RETURN(auto creation_json, dataset.to_json());
+   *  auto round_tripped = mdio::Dataset::from_json(
+   *      creation_json, "path/to/copy", mdio::zarr::ZarrVersion::kV3,
+   *      mdio::constants::kCreateClean);
+   * @endcode
+   * The output carries the logical schema: variable names, data types,
+   * dimensions, chunk grids, compressors, long names, coordinates and the
+   * stored user attributes ("statsV1"/"unitsV1"/"attributes"). It is
+   * validated against the dataset creation schema before being returned, so
+   * a successful result can be fed back to from_json().
+   *
+   * Datasets with header variables are rejected: the creation schema has no
+   * representation for them, so serializing them would produce a JSON that
+   * silently drops them when re-created.
+   * @param defaults Whether to include default values in the underlying
+   * spec serialization.
+   * @return The creation JSON on success, or an error.
+   */
+  Result<nlohmann::json> to_json(
+      IncludeDefaults defaults = IncludeDefaults{}) const {
+    if (!header_variables.get_iterable_accessor().empty()) {
+      return absl::InvalidArgumentError(
+          "to_json() does not support datasets with header variables: the "
+          "creation schema consumed by from_json() has no representation for "
+          "them, so the round-trip would silently drop them. Creation-side "
+          "header variable support is a prerequisite.");
+    }
+
+    nlohmann::json out;
+    out["metadata"] = metadata;
+    out["variables"] = nlohmann::json::array();
+    for (const auto& key : variables.get_iterable_accessor()) {
+      auto var_result = variables.at(key);
+      if (!var_result.ok()) {
+        return var_result.status();
+      }
+      std::vector<std::string> var_coordinates;
+      auto coordinate_it = coordinates.find(key);
+      if (coordinate_it != coordinates.end()) {
+        var_coordinates = coordinate_it->second;
+      }
+      MDIO_ASSIGN_OR_RETURN(const nlohmann::json entry,
+                            internal::VariableToCreationJson(
+                                var_result.value(), var_coordinates, defaults));
+      out["variables"].push_back(entry);
+    }
+
+    // The output must be consumable by from_json(); validate a copy because
+    // validate_dataset normalizes legacy compressor keys in place.
+    nlohmann::json validated = out;
+    absl::Status validation = validate_dataset(validated);
+    if (!validation.ok()) {
+      return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "to_json() produced a spec that fails creation validation: " +
+              std::string(validation.message()));
+    }
+    return out;
+  }
 
   /// variables contained in the dataset
   VariableCollection variables;

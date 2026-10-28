@@ -390,6 +390,256 @@ mdio::Result<mdio::Dataset> makePopulated(const std::string& path) {
   return ds;
 }
 
+// A populated store whose coordinate axes are monotonic with non-uniform
+// steps, so nearest-value endpoint selection is observable:
+//   inline    (descending): 20, 18, 15, 12, 10, 8, 5, 3, 2, 1
+//   crossline (ascending):   0,  2,  5,  9, 14, 20, 27, 35, 44, 54
+//   depth     (ascending):   0,  1,  2,  3
+mdio::Result<mdio::Dataset> makeMonotonicPopulated(const std::string& path) {
+  std::string schema = R"(
+{
+  "metadata": {
+    "name": "monotonicSelTester",
+    "apiVersion": "1.0.0",
+    "createdOn": "2024-08-23T08:56:00.000000-06:00"
+  },
+  "variables": [
+    {
+      "name": "data",
+      "dataType": "float32",
+      "dimensions": [
+        {"name": "inline", "size": 10},
+        {"name": "crossline", "size": 10},
+        {"name": "depth", "size": 4}
+      ]
+    },
+    {
+      "name": "inline",
+      "dataType": "int32",
+      "dimensions": [{"name": "inline", "size": 10}]
+    },
+    {
+      "name": "crossline",
+      "dataType": "int32",
+      "dimensions": [{"name": "crossline", "size": 10}]
+    },
+    {
+      "name": "depth",
+      "dataType": "int32",
+      "dimensions": [{"name": "depth", "size": 4}]
+    }
+  ]
+})";
+  nlohmann::json j = nlohmann::json::parse(schema);
+  auto dsFut = mdio::Dataset::from_json(j, path, mdio::constants::kCreateClean);
+  if (!dsFut.status().ok()) {
+    return dsFut.status();
+  }
+  auto ds = dsFut.value();
+  MDIO_ASSIGN_OR_RETURN(auto dataVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("data"));
+  MDIO_ASSIGN_OR_RETURN(auto inlineVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("inline"));
+  MDIO_ASSIGN_OR_RETURN(auto crosslineVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("crossline"));
+  MDIO_ASSIGN_OR_RETURN(auto depthVar,
+                        ds.variables.get<mdio::dtypes::int32_t>("depth"));
+
+  MDIO_ASSIGN_OR_RETURN(auto dataData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(dataVar));
+  MDIO_ASSIGN_OR_RETURN(auto inlineData,
+                        mdio::from_variable<mdio::dtypes::int32_t>(inlineVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineData,
+      mdio::from_variable<mdio::dtypes::int32_t>(crosslineVar));
+  MDIO_ASSIGN_OR_RETURN(auto depthData,
+                        mdio::from_variable<mdio::dtypes::int32_t>(depthVar));
+
+  auto dataAccessor = dataData.get_data_accessor();
+  auto inlineAccessor = inlineData.get_data_accessor();
+  auto crosslineAccessor = crosslineData.get_data_accessor();
+  auto depthAccessor = depthData.get_data_accessor();
+
+  std::vector<mdio::dtypes::int32_t> inlineCoords(
+      {20, 18, 15, 12, 10, 8, 5, 3, 2, 1});
+  std::vector<mdio::dtypes::int32_t> crosslineCoords(
+      {0, 2, 5, 9, 14, 20, 27, 35, 44, 54});
+
+  for (int i = 0; i < 10; ++i) {
+    inlineAccessor({i}) = inlineCoords[i];
+    crosslineAccessor({i}) = crosslineCoords[i];
+  }
+  for (int i = 0; i < 4; ++i) {
+    depthAccessor({i}) = i;
+  }
+
+  auto inlineFut = inlineVar.Write(inlineData);
+  auto crosslineFut = crosslineVar.Write(crosslineData);
+  auto depthFut = depthVar.Write(depthData);
+
+  for (int i = 0; i < 10; ++i) {
+    for (int j = 0; j < 10; ++j) {
+      for (int k = 0; k < 4; ++k) {
+        dataAccessor({i, j, k}) = static_cast<float>(inlineCoords[i]) +
+                                  crosslineCoords[j] * 0.1f +
+                                  static_cast<float>(k);
+      }
+    }
+  }
+
+  auto dataFut = dataVar.Write(dataData);
+
+  if (!inlineFut.status().ok()) {
+    return inlineFut.status();
+  }
+  if (!crosslineFut.status().ok()) {
+    return crosslineFut.status();
+  }
+  if (!depthFut.status().ok()) {
+    return depthFut.status();
+  }
+  if (!dataFut.status().ok()) {
+    return dataFut.status();
+  }
+
+  return ds;
+}
+
+// A populated store with floating-point coordinate axes, two of them
+// NaN-poisoned (the nav-gap CDP-coordinate shape):
+//   inline    (ascending with NaN):  1, 2, NaN, 4
+//   crossline (descending with NaN): 4, NaN, 2, 1
+//   depth     (ascending, clean):    10, 20
+mdio::Result<mdio::Dataset> makeNaNAxisPopulated(const std::string& path) {
+  std::string schema = R"(
+{
+  "metadata": {
+    "name": "nanSelTester",
+    "apiVersion": "1.0.0",
+    "createdOn": "2024-08-23T08:56:00.000000-06:00"
+  },
+  "variables": [
+    {
+      "name": "data",
+      "dataType": "float32",
+      "dimensions": [
+        {"name": "inline", "size": 4},
+        {"name": "crossline", "size": 4},
+        {"name": "depth", "size": 2}
+      ]
+    },
+    {
+      "name": "inline",
+      "dataType": "float32",
+      "dimensions": [{"name": "inline", "size": 4}]
+    },
+    {
+      "name": "crossline",
+      "dataType": "float32",
+      "dimensions": [{"name": "crossline", "size": 4}]
+    },
+    {
+      "name": "depth",
+      "dataType": "float32",
+      "dimensions": [{"name": "depth", "size": 2}]
+    }
+  ]
+})";
+  nlohmann::json j = nlohmann::json::parse(schema);
+  auto dsFut = mdio::Dataset::from_json(j, path, mdio::constants::kCreateClean);
+  if (!dsFut.status().ok()) {
+    return dsFut.status();
+  }
+  auto ds = dsFut.value();
+  MDIO_ASSIGN_OR_RETURN(auto dataVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("data"));
+  MDIO_ASSIGN_OR_RETURN(auto inlineVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("inline"));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineVar, ds.variables.get<mdio::dtypes::float32_t>("crossline"));
+  MDIO_ASSIGN_OR_RETURN(auto depthVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("depth"));
+
+  MDIO_ASSIGN_OR_RETURN(auto dataData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(dataVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto inlineData, mdio::from_variable<mdio::dtypes::float32_t>(inlineVar));
+  MDIO_ASSIGN_OR_RETURN(
+      auto crosslineData,
+      mdio::from_variable<mdio::dtypes::float32_t>(crosslineVar));
+  MDIO_ASSIGN_OR_RETURN(auto depthData,
+                        mdio::from_variable<mdio::dtypes::float32_t>(depthVar));
+
+  auto dataAccessor = dataData.get_data_accessor();
+  auto inlineAccessor = inlineData.get_data_accessor();
+  auto crosslineAccessor = crosslineData.get_data_accessor();
+  auto depthAccessor = depthData.get_data_accessor();
+
+  const float nanValue = std::numeric_limits<float>::quiet_NaN();
+  std::vector<mdio::dtypes::float32_t> inlineCoords({1, 2, nanValue, 4});
+  std::vector<mdio::dtypes::float32_t> crosslineCoords({4, nanValue, 2, 1});
+  std::vector<mdio::dtypes::float32_t> depthCoords({10, 20});
+
+  for (int i = 0; i < 4; ++i) {
+    inlineAccessor({i}) = inlineCoords[i];
+    crosslineAccessor({i}) = crosslineCoords[i];
+  }
+  for (int i = 0; i < 2; ++i) {
+    depthAccessor({i}) = depthCoords[i];
+  }
+
+  auto inlineFut = inlineVar.Write(inlineData);
+  auto crosslineFut = crosslineVar.Write(crosslineData);
+  auto depthFut = depthVar.Write(depthData);
+
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        dataAccessor({i, j, k}) =
+            inlineCoords[i] + crosslineCoords[j] * 0.1f +
+            static_cast<float>(k);
+      }
+    }
+  }
+
+  auto dataFut = dataVar.Write(dataData);
+
+  if (!inlineFut.status().ok()) {
+    return inlineFut.status();
+  }
+  if (!crosslineFut.status().ok()) {
+    return crosslineFut.status();
+  }
+  if (!depthFut.status().ok()) {
+    return depthFut.status();
+  }
+  if (!dataFut.status().ok()) {
+    return dataFut.status();
+  }
+
+  return ds;
+}
+
+// Reads all values of the 1-D int32 coordinate `label` from `dataset`.
+mdio::Result<std::vector<mdio::dtypes::int32_t>> readCoordinate(
+    mdio::Dataset& dataset, const std::string& label) {
+  MDIO_ASSIGN_OR_RETURN(auto var,
+                        dataset.variables.get<mdio::dtypes::int32_t>(label));
+  auto readFut = var.Read();
+  if (!readFut.status().ok()) {
+    return readFut.status();
+  }
+  auto data = readFut.value();
+  auto accessor = data.get_data_accessor();
+  auto offset = data.get_flattened_offset();
+  std::vector<mdio::dtypes::int32_t> values;
+  values.reserve(var.num_samples());
+  for (mdio::Index i = offset; i < var.num_samples() + offset; ++i) {
+    values.push_back(accessor({i}));
+  }
+  return values;
+}
+
 TEST(DatasetSpec, valid) {
   auto dataset = make();
 
@@ -881,6 +1131,10 @@ TEST(Dataset, selRangeFlippedStartStop) {
 
   auto sliceRes = ds.sel(ilRange);
   ASSERT_FALSE(sliceRes.status().ok());
+  // The exact-endpoint path errors at the value level, like its monotonic
+  // sibling, instead of surfacing downstream as an index-level error.
+  EXPECT_THAT(sliceRes.status().message(),
+              testing::HasSubstr("Start value happens after stop value"));
 }
 
 TEST(Dataset, selRepeatedListSingleton) {
@@ -929,6 +1183,233 @@ TEST(Dataset, selRepeatedRangeStop) {
 
   auto sliceRes = ds.sel(ilRange);
   ASSERT_FALSE(sliceRes.status().ok());
+}
+
+// Range endpoints on a monotonic axis select the nearest contained
+// coordinate value (xarray/pandas label-slicing semantics), verified
+// against mdio-python on the same store.
+TEST(Dataset, selRangeNearestValueAscending) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // crossline = [0, 2, 5, 9, 14, 20, 27, 35, 44, 54]
+  // Start 1 snaps up to 2; stop 40 snaps down to 35.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> xlRange = {"crossline", 1, 40,
+                                                          1};
+  auto sliceRes = ds.sel(xlRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "crossline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(2, 5, 9, 14, 20, 27, 35));
+
+  // Both endpoints snap to the same contained value: a single sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> singleRange = {"crossline", 40,
+                                                              50, 1};
+  auto singleRes = ds.sel(singleRange);
+  ASSERT_TRUE(singleRes.ok()) << singleRes.status();
+  auto singleCoordsRes = readCoordinate(singleRes.value(), "crossline");
+  ASSERT_TRUE(singleCoordsRes.ok()) << singleCoordsRes.status();
+  EXPECT_THAT(singleCoordsRes.value(), testing::ElementsAre(44));
+}
+
+// Endpoints partially outside a monotonic axis clamp to the contained
+// edge rather than erroring.
+TEST(Dataset, selRangeNearestValueAscendingClampsToEnds) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Start -3 is below the minimum 0; it clamps to the first sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> lowRange = {"crossline", -3, 5,
+                                                           1};
+  auto lowRes = ds.sel(lowRange);
+  ASSERT_TRUE(lowRes.ok()) << lowRes.status();
+  auto lowCoordsRes = readCoordinate(lowRes.value(), "crossline");
+  ASSERT_TRUE(lowCoordsRes.ok()) << lowCoordsRes.status();
+  EXPECT_THAT(lowCoordsRes.value(), testing::ElementsAre(0, 2, 5));
+
+  // Stop 60 is above the maximum 54; it clamps to the last sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> highRange = {"crossline", 40, 60,
+                                                            1};
+  auto highRes = ds.sel(highRange);
+  ASSERT_TRUE(highRes.ok()) << highRes.status();
+  auto highCoordsRes = readCoordinate(highRes.value(), "crossline");
+  ASSERT_TRUE(highCoordsRes.ok()) << highCoordsRes.status();
+  EXPECT_THAT(highCoordsRes.value(), testing::ElementsAre(44, 54));
+}
+
+// Descending axes mirror the ascending semantics: start selects the
+// first value <= bound, stop the last value >= bound (mdio-python
+// behavior, verified empirically).
+TEST(Dataset, selRangeNearestValueDescending) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [20, 18, 15, 12, 10, 8, 5, 3, 2, 1]
+  // Start 17 snaps down to 15; stop 4 snaps up to 5.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 17, 4, 1};
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "inline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(15, 12, 10, 8, 5));
+
+  // Start 19 snaps down to 18; stop 2 is exact.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> snapRange = {"inline", 19, 2, 1};
+  auto snapRes = ds.sel(snapRange);
+  ASSERT_TRUE(snapRes.ok()) << snapRes.status();
+  auto snapCoordsRes = readCoordinate(snapRes.value(), "inline");
+  ASSERT_TRUE(snapCoordsRes.ok()) << snapCoordsRes.status();
+  EXPECT_THAT(snapCoordsRes.value(),
+              testing::ElementsAre(18, 15, 12, 10, 8, 5, 3, 2));
+}
+
+// Endpoints partially outside a descending axis clamp to the contained
+// edge (mdio-python behavior, verified empirically).
+TEST(Dataset, selRangeNearestValueDescendingClampsToEnds) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Start 25 is above the maximum 20; it clamps to the first sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> highRange = {"inline", 25, 10,
+                                                            1};
+  auto highRes = ds.sel(highRange);
+  ASSERT_TRUE(highRes.ok()) << highRes.status();
+  auto highCoordsRes = readCoordinate(highRes.value(), "inline");
+  ASSERT_TRUE(highCoordsRes.ok()) << highCoordsRes.status();
+  EXPECT_THAT(highCoordsRes.value(), testing::ElementsAre(20, 18, 15, 12, 10));
+
+  // Stop 0 is below the minimum 1; it clamps to the last sample.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> lowRange = {"inline", 15, 0, 1};
+  auto lowRes = ds.sel(lowRange);
+  ASSERT_TRUE(lowRes.ok()) << lowRes.status();
+  auto lowCoordsRes = readCoordinate(lowRes.value(), "inline");
+  ASSERT_TRUE(lowCoordsRes.ok()) << lowCoordsRes.status();
+  EXPECT_THAT(lowCoordsRes.value(),
+              testing::ElementsAre(15, 12, 10, 8, 5, 3, 2, 1));
+}
+
+// Endpoints entirely outside the axis are an error, not a clamp to the
+// nearest edge and not an empty selection.
+TEST(Dataset, selRangeEntirelyOutsideRange) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // Ascending axis [0 .. 54]: start beyond the maximum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ascStart = {"crossline", 60, 70,
+                                                           1};
+  auto ascStartRes = ds.sel(ascStart);
+  EXPECT_FALSE(ascStartRes.status().ok());
+
+  // Ascending axis: stop below the minimum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ascStop = {"crossline", -10, -5,
+                                                          1};
+  auto ascStopRes = ds.sel(ascStop);
+  EXPECT_FALSE(ascStopRes.status().ok());
+
+  // Descending axis [20 .. 1]: stop beyond the maximum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> descStop = {"inline", 30, 40, 1};
+  auto descStopRes = ds.sel(descStop);
+  EXPECT_FALSE(descStopRes.status().ok());
+
+  // Descending axis: start below the minimum.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> descStart = {"inline", -5, 0, 1};
+  auto descStartRes = ds.sel(descStart);
+  EXPECT_FALSE(descStartRes.status().ok());
+}
+
+// A start endpoint that resolves after the stop endpoint (flipped
+// selection) is not supported, on descending axes as on ascending ones.
+TEST(Dataset, selRangeDescendingFlippedStartStop) {
+  std::string path = "zarrs/monotonicSelTester.mdio";
+  auto dsRes = makeMonotonicPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [20, 18, 15, 12, 10, 8, 5, 3, 2, 1]
+  // Start 3 resolves to index 6; stop 18 resolves to index 1.
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 3, 18, 1};
+
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_FALSE(sliceRes.status().ok());
+}
+
+// A NaN on a floating-point coordinate axis must fail the range selection
+// loudly. The order classification is NaN-blind ([1, 2, NaN, 4] passes
+// std::is_sorted) and the endpoint binary searches resolve bounds onto the
+// NaN position, so without the guard the range [3, 3.5] silently selects
+// at the NaN index instead of erroring.
+TEST(Dataset, selRangeNaNAxisErrors) {
+  std::string path = "zarrs/nanSelTester.mdio";
+  auto dsRes = makeNaNAxisPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [1, 2, NaN, 4]: classifies as ascending without the guard,
+  // and both endpoints of [3, 3.5] resolve onto the NaN position.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> ascRange = {"inline", 3, 3.5f,
+                                                             1};
+  auto ascRes = ds.sel(ascRange);
+  ASSERT_FALSE(ascRes.status().ok());
+  EXPECT_THAT(ascRes.status().message(), testing::HasSubstr("inline"));
+  EXPECT_THAT(ascRes.status().message(), testing::HasSubstr("NaN"));
+
+  // crossline = [4, NaN, 2, 1]: a descending axis with NaN errors too.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> descRange = {"crossline", 3,
+                                                              1.5f, 1};
+  auto descRes = ds.sel(descRange);
+  ASSERT_FALSE(descRes.status().ok());
+  EXPECT_THAT(descRes.status().message(), testing::HasSubstr("crossline"));
+  EXPECT_THAT(descRes.status().message(), testing::HasSubstr("NaN"));
+
+  // depth = [10, 20]: a clean floating-point axis still selects; the
+  // range [5, 15] snaps both endpoints to 10.
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> cleanRange = {"depth", 5, 15,
+                                                               1};
+  auto cleanRes = ds.sel(cleanRange);
+  ASSERT_TRUE(cleanRes.status().ok()) << cleanRes.status();
+  auto depthVar =
+      cleanRes.value().variables.get<mdio::dtypes::float32_t>("depth");
+  ASSERT_TRUE(depthVar.status().ok()) << depthVar.status();
+  auto depthFut = depthVar.value().Read();
+  ASSERT_TRUE(depthFut.status().ok()) << depthFut.status();
+  auto depthData = depthFut.value();
+  auto depthAccessor = depthData.get_data_accessor();
+  auto depthOffset = depthData.get_flattened_offset();
+  std::vector<mdio::dtypes::float32_t> depthValues;
+  for (mdio::Index i = depthOffset;
+       i < depthVar.value().num_samples() + depthOffset; ++i) {
+    depthValues.push_back(depthAccessor({i}));
+  }
+  EXPECT_THAT(depthValues, testing::ElementsAre(testing::FloatEq(10.0f)));
+}
+
+// Unordered axes (the selTester inline axis repeats values) keep requiring
+// exact, unique endpoints; the selection is positional between them.
+// mdio-python returns [2, 3, 4, 3, 5] for the same slice on this store.
+TEST(Dataset, selRangeUnorderedExactEndpoints) {
+  std::string path = "zarrs/selTester.mdio";
+  auto dsRes = makePopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // inline = [1, 2, 3, 4, 3, 5, 6, 7, 8, 8]
+  mdio::RangeDescriptor<mdio::dtypes::int32_t> ilRange = {"inline", 2, 5, 1};
+
+  auto sliceRes = ds.sel(ilRange);
+  ASSERT_TRUE(sliceRes.ok()) << sliceRes.status();
+  auto coordsRes = readCoordinate(sliceRes.value(), "inline");
+  ASSERT_TRUE(coordsRes.ok()) << coordsRes.status();
+  EXPECT_THAT(coordsRes.value(), testing::ElementsAre(2, 3, 4, 3, 5));
 }
 
 TEST(Dataset, selectField) {
@@ -1824,6 +2305,189 @@ TEST(Dataset, selRangeWithSameStartStop) {
   ASSERT_FALSE(sliceRes.status().ok());
   EXPECT_THAT(sliceRes.status().message(),
               testing::HasSubstr("Start and stop values must be different"));
+}
+
+// ============================================================================
+// Dataset::to_json — creation-schema serialization
+// ============================================================================
+
+/**
+ * @brief Returns the variable entry with the given name from a creation JSON,
+ * or a null JSON when absent.
+ */
+nlohmann::json FindVariableEntry(const nlohmann::json& creation_json,
+                                 const std::string& name) {
+  for (const auto& entry : creation_json.at("variables")) {
+    if (entry.at("name") == name) {
+      return entry;
+    }
+  }
+  return nlohmann::json();
+}
+
+TEST_P(DatasetVersionTest, toJsonRoundTrip) {
+  auto json_vars = GetToyExample();
+  auto datasetRes = mdio::Dataset::from_json(json_vars, base_path_, version_,
+                                             mdio::constants::kCreateClean);
+  ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
+  auto ds = datasetRes.value();
+
+  auto jsonRes = ds.to_json();
+  ASSERT_TRUE(jsonRes.status().ok()) << jsonRes.status();
+  nlohmann::json creation_json = jsonRes.value();
+
+  // --- Sampling of the serialized logical schema. ---
+  EXPECT_EQ(creation_json.at("metadata").at("name"), "campos_3d");
+  EXPECT_TRUE(
+      creation_json.at("metadata").at("attributes").contains("textHeader"));
+
+  ASSERT_EQ(creation_json.at("variables").size(), 9);
+
+  const nlohmann::json image = FindVariableEntry(creation_json, "image");
+  ASSERT_FALSE(image.is_null());
+  EXPECT_EQ(image.at("dataType"), "float32");
+  EXPECT_EQ(image.at("dimensions"),
+            nlohmann::json({"inline", "crossline", "depth"}));
+  EXPECT_EQ(
+      image.at("metadata").at("chunkGrid").at("configuration").at("chunkShape"),
+      nlohmann::json({128, 128, 128}));
+  EXPECT_EQ(image.at("compressor").at("cname"), "zstd");
+  EXPECT_EQ(image.at("metadata").at("statsV1").at("count"), 100);
+  EXPECT_EQ(image.at("metadata").at("attributes").at("fizz"), "buzz");
+  EXPECT_EQ(image.at("coordinates"), nlohmann::json({"cdp-x", "cdp-y"}));
+
+  const nlohmann::json velocity = FindVariableEntry(creation_json, "velocity");
+  ASSERT_FALSE(velocity.is_null());
+  EXPECT_EQ(velocity.at("dataType"), "float16");
+  // unitsV1 must keep the stored object form; the in-memory flattened form
+  // ("m/s") is rejected by the creation schema.
+  EXPECT_EQ(velocity.at("metadata").at("unitsV1"),
+            nlohmann::json({{"speed", "m/s"}}));
+
+  const nlohmann::json image_inline =
+      FindVariableEntry(creation_json, "image_inline");
+  ASSERT_FALSE(image_inline.is_null());
+  EXPECT_EQ(image_inline.at("longName"),
+            "inline optimized version of 3d_stack");
+
+  const nlohmann::json image_headers =
+      FindVariableEntry(creation_json, "image_headers");
+  ASSERT_FALSE(image_headers.is_null());
+  EXPECT_EQ(image_headers.at("dimensions"),
+            nlohmann::json({"inline", "crossline"}));
+  const nlohmann::json fields = image_headers.at("dataType").at("fields");
+  ASSERT_EQ(fields.size(), 4);
+  EXPECT_EQ(fields.at(0).at("name"), "cdp-x");
+  EXPECT_EQ(fields.at(0).at("format"), "int32");
+  EXPECT_EQ(fields.at(3).at("name"), "some_scalar");
+  EXPECT_EQ(fields.at(3).at("format"), "float16");
+
+  const nlohmann::json inline_var = FindVariableEntry(creation_json, "inline");
+  ASSERT_FALSE(inline_var.is_null());
+  // Dimension coordinates use the object form so the create path registers
+  // the dimension.
+  const nlohmann::json inline_dimension = {{"name", "inline"}, {"size", 256}};
+  EXPECT_EQ(inline_var.at("dimensions"),
+            nlohmann::json::array({inline_dimension}));
+
+  const nlohmann::json depth = FindVariableEntry(creation_json, "depth");
+  ASSERT_FALSE(depth.is_null());
+  EXPECT_EQ(depth.at("metadata").at("unitsV1"),
+            nlohmann::json({{"length", "m"}}));
+
+  // --- Round-trip: re-create the dataset from the serialized form. ---
+  const std::string copy_path = base_path_ + "_to_json_roundtrip";
+  std::filesystem::remove_all(copy_path);
+  {
+    auto copyRes = mdio::Dataset::from_json(creation_json, copy_path, version_,
+                                            mdio::constants::kCreateClean);
+    ASSERT_TRUE(copyRes.status().ok()) << copyRes.status();
+    auto copy = copyRes.value();
+
+    // get_iterable_accessor() is sorted; get_keys() order is unspecified.
+    EXPECT_EQ(ds.variables.get_iterable_accessor(),
+              copy.variables.get_iterable_accessor());
+
+    // The copy serializes to the same creation JSON: the logical schema
+    // survives the round-trip unchanged.
+    auto copyJsonRes = copy.to_json();
+    ASSERT_TRUE(copyJsonRes.status().ok()) << copyJsonRes.status();
+    EXPECT_EQ(copyJsonRes.value(), creation_json);
+  }
+  // The copy is destroyed here so the kvstore releases its files before the
+  // directory cleanup (NFS silly-rename otherwise keeps them busy).
+  std::filesystem::remove_all(copy_path);
+}
+
+TEST_P(DatasetVersionTest, toJsonOutputPassesSchemaValidation) {
+  auto json_vars = GetToyExample();
+  auto datasetRes = mdio::Dataset::from_json(json_vars, base_path_, version_,
+                                             mdio::constants::kCreateClean);
+  ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
+
+  auto jsonRes = datasetRes.value().to_json();
+  ASSERT_TRUE(jsonRes.status().ok()) << jsonRes.status();
+
+  // to_json() validates internally; pin the contract explicitly against the
+  // creation schema, the same check from_json() runs.
+  nlohmann::json creation_json = jsonRes.value();
+  auto validation = validate_schema(creation_json);
+  EXPECT_TRUE(validation.ok()) << validation;
+}
+
+// Struct-array round-trip is covered by toJsonRoundTrip above (field-level
+// assertions + creation-JSON equality). The plan's original gate premise
+// ("spec derivation yields 'byte'") was refuted by the implementation:
+// to_json derives dataType from the zarr dtype metadata, not the top-level
+// spec. The remaining struct limitation is cross-tool (zarr-python write
+// dialect, Issue 01) — not mdio-cpp round-trip.
+
+TEST(Dataset, toJsonRejectsHeaderVariablesLoudly) {
+  // Header variables can only be built through Dataset::Open with a
+  // header-only spec; from_json() has no creation representation for them.
+  const nlohmann::json metadata = {
+      {"name", "header_only"},
+      {"apiVersion", "1.0.0"},
+      {"createdOn", "2023-12-12T15:02:06.413469-06:00"}};
+  const nlohmann::json header_spec = nlohmann::json::parse(R"({
+    "_mdio_header_only": true,
+    "driver": "zarr3",
+    "kvstore": {
+      "driver": "file",
+      "path": "zarrs/to_json_header_only/segy_file_header"
+    },
+    "_mdio_array_metadata": {
+      "shape": [],
+      "data_type": {
+        "name": "fixed_length_utf32",
+        "configuration": {"length_bytes": 4}
+      },
+      "attributes": {
+        "textHeader": "C01 EXAMPLE"
+      }
+    }
+  })");
+
+  auto dsRes =
+      mdio::Dataset::Open(metadata, {header_spec}, mdio::constants::kOpen);
+  ASSERT_TRUE(dsRes.status().ok()) << dsRes.status();
+  auto ds = dsRes.value();
+  ASSERT_EQ(ds.header_variables.get_iterable_accessor().size(), 1);
+
+  auto jsonRes = ds.to_json();
+  ASSERT_FALSE(jsonRes.status().ok());
+  EXPECT_EQ(jsonRes.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_THAT(jsonRes.status().message(),
+              testing::HasSubstr("header variables"));
+}
+
+TEST(Dataset, toJsonHeaderVariableRoundTripPreservation) {
+  GTEST_SKIP()
+      << "Prerequisite-gated (api-gap-plan M1): from_json()/Construct "
+         "rejects header-variable entries because the creation schema has no "
+         "representation for them. Creation-side header variable support "
+         "must land before the round-trip can preserve them; until then "
+         "to_json() fails loudly instead of silently dropping them.";
 }
 
 }  // namespace

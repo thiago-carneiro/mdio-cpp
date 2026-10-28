@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "absl/strings/str_split.h"
+#include "mdio/chunk_iterator.h"
 #include "mdio/impl.h"
 #include "mdio/stats.h"
 #include "mdio/zarr/zarr.h"
@@ -1207,6 +1208,10 @@ class Variable : public VariableBase {
    * @param desc The slice descriptor to be clamped
    * @return A slice descriptor that will not go out-of-bounds for the given
    * Variable.
+   * @note A sliced Variable's domain carries an offset: slicing a `[0, 383)`
+   * domain with descriptor `{83, 383}` yields domain `[83, 383)` (origin 83,
+   * shape 300). The clamp must therefore compare against `origin + shape` as
+   * the exclusive upper bound, not `shape` alone.
    */
   RangeDescriptor<Index> sliceInRange(
       const RangeDescriptor<Index>& desc) const {
@@ -1288,6 +1293,10 @@ class Variable : public VariableBase {
    * @post The resulting Variable will be sliced along the specified dimensions
    * within it's domain. If the slice lay outside of the domain of the Variable,
    * the slice will be clamped to the domain.
+   * @note Descriptor start/stop are domain indices, not coordinate values.
+   * A freshly opened variable's domain is 0-based `[0, shape)` (zarr has no
+   * origin concept); a sliced variable's domain carries an offset. To select
+   * by coordinate value, use `Dataset::sel`.
    * @param descriptors The descriptors used to specify the slice.
    * @details \b Usage
    * This provides an example of slicing the Variable along the inline and
@@ -1314,10 +1323,12 @@ class Variable : public VariableBase {
     steps.reserve(N);
 
     int8_t bad_idx = -1;
+    RangeDescriptor<Index> bad_d = {};
     for (size_t i = 0; i < N; ++i) {
       auto d = sliceInRange(descs[i]);
       if (d.start > d.stop) {
         bad_idx = static_cast<int8_t>(i);
+        bad_d = d;
         break;
       }
       if (this->hasLabel(d.label)) {
@@ -1328,11 +1339,11 @@ class Variable : public VariableBase {
       }
     }
     if (bad_idx >= 0) {
-      auto& err = descs[bad_idx];
+      // Report the clamped descriptor: it is what failed the check above.
       return Result<Variable>{absl::InvalidArgumentError(
           std::string("Slice descriptor for ") +
-          std::string(err.label.label()) + " is invalid: start=" +
-          std::to_string(err.start) + " > stop=" + std::to_string(err.stop))};
+          std::string(bad_d.label.label()) + " is invalid: start=" +
+          std::to_string(bad_d.start) + " > stop=" + std::to_string(bad_d.stop))};
     }
 
     // 3) Fast path: all labels (or axis indices) are unique
@@ -1478,6 +1489,127 @@ class Variable : public VariableBase {
     }
 
     return absl::NotFoundError("Metadata did not contain chunk shape.");
+  }
+
+  /**
+   * @brief Iterates over the variable's chunk grid.
+   *
+   * Yields tensorstore::Box values with absolute indices into the variable's
+   * index domain; edge chunks yield partial boxes, never out-of-bounds
+   * indices. The grid is derived from the stored format's chunk shape
+   * (get_chunk_shape()), so a rechunked or reformatted store changes the
+   * iteration; that is intended. Traversal order is row-major and is not a
+   * contract.
+   *
+   * The grid is anchored at the domain origin: a freshly opened variable's
+   * domain is 0-based, so the boxes coincide with the stored format's
+   * physical chunk grid; a sliced variable's domain carries an offset and the
+   * grid is tessellated over that offset domain starting at its origin.
+   *
+   * This is API ergonomics, not an I/O pattern: the read path stays
+   * `tensorstore::Read(store)`. Do not adopt one-box-per-chunk as the default
+   * read pattern.
+   * @details \b Usage
+   * @code
+   * MDIO_ASSIGN_OR_RETURN(auto chunks, velocity.chunks());
+   * for (const auto& chunk : chunks) {
+   *   // chunk.origin() and chunk.shape() are absolute domain indices.
+   * }
+   * @endcode
+   * @return An `mdio::Result` object containing the chunk range; NotFoundError
+   * if the stored metadata carries no chunk shape, InvalidArgumentError if
+   * the domain has a non-positive dimension size.
+   */
+  Result<ChunkRange> chunks() const {
+    auto domain = dimensions();
+    std::vector<Index> domain_origin(domain.origin().begin(),
+                                     domain.origin().end());
+    std::vector<Index> domain_shape(domain.shape().begin(),
+                                    domain.shape().end());
+    MDIO_ASSIGN_OR_RETURN(auto chunk_shape, get_chunk_shape());
+    return ChunkRange::Create(std::move(domain_origin), std::move(domain_shape),
+                              std::move(chunk_shape));
+  }
+
+  /**
+   * @brief Iterates over the chunk grid projected onto a subset of the
+   * variable's dimensions.
+   *
+   * Only the named dimensions are chunked: the grid iterates the chunk
+   * positions of the given dimensions, while every dimension left out of the
+   * subset is covered at its FULL domain extent. Each box spans one chunk
+   * position along each named dimension and the complete extent along all
+   * the others, in absolute domain indices, with partial edge chunks on the
+   * named dimensions — the same invariants as the full chunks() grid. The
+   * number of boxes is the product of the chunk counts along the named
+   * dimensions only.
+   *
+   * @details \b Usage
+   * @code
+   * // Spatial tiles, each covering the full time extent:
+   * MDIO_ASSIGN_OR_RETURN(auto spatial_chunks,
+   *                       velocity.chunks("inline", "crossline"));
+   * for (const auto& chunk : spatial_chunks) {
+   *   // chunk.shape()[2] == the full time extent.
+   * }
+   * @endcode
+   * @param dims The dimensions to chunk, each a label or a zero-based
+   * dimension index. The list must not be empty, every dimension must exist
+   * in the variable's domain, and no dimension may be named twice.
+   * @return An `mdio::Result` object containing the chunk range;
+   * InvalidArgumentError if the subset is empty, a dimension does not exist,
+   * or a dimension is named twice; the same errors as chunks() otherwise.
+   */
+  Result<ChunkRange> chunks(
+      const std::vector<DimensionIdentifier>& dims) const {
+    if (dims.empty()) {
+      return absl::InvalidArgumentError(
+          "Dimension subset must not be empty; call chunks() for the full "
+          "grid.");
+    }
+    auto domain = dimensions();
+    const std::size_t rank = domain.labels().size();
+    std::vector<Index> domain_origin(domain.origin().begin(),
+                                     domain.origin().end());
+    std::vector<Index> domain_shape(domain.shape().begin(),
+                                    domain.shape().end());
+    MDIO_ASSIGN_OR_RETURN(auto chunk_shape, get_chunk_shape());
+    if (chunk_shape.size() != rank) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Chunk grid requires one entry per dimension: got chunk shape rank ",
+          chunk_shape.size(), ", domain rank ", rank, "."));
+    }
+
+    // Dimensions left out of the subset are covered at full extent: seed the
+    // projected chunk shape with the domain shape (one chunk per dimension),
+    // then overwrite the named dimensions with the stored chunk size.
+    std::vector<Index> projected_chunk_shape = domain_shape;
+    std::vector<bool> named(rank, false);
+    for (const auto& dim : dims) {
+      MDIO_ASSIGN_OR_RETURN(auto position, ResolveDimensionPosition(dim));
+      if (named[position]) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("Dimension subset names dimension ", position,
+                         " of variable ", variableName, " more than once."));
+      }
+      named[position] = true;
+      projected_chunk_shape[position] = chunk_shape[position];
+    }
+    return ChunkRange::Create(std::move(domain_origin), std::move(domain_shape),
+                              std::move(projected_chunk_shape));
+  }
+
+  /**
+   * @brief Iterates over the chunk grid projected onto a subset of the
+   * variable's dimensions (variadic form).
+   * @param dims The dimensions to chunk, each a label or a zero-based
+   * dimension index; see the vector overload for the projection semantics.
+   * @return An `mdio::Result` object containing the chunk range; the same
+   * errors as the vector overload.
+   */
+  template <typename... DimensionIdentifier>
+  Result<ChunkRange> chunks(const DimensionIdentifier&... dims) const {
+    return chunks(std::vector<mdio::DimensionIdentifier>({dims...}));
   }
 
   /**
@@ -1711,6 +1843,38 @@ class Variable : public VariableBase {
   }
 
  private:
+  /**
+   * @brief Resolves a dimension identifier to its zero-based domain position.
+   *
+   * Label-form identifiers are matched against the domain labels; index-form
+   * identifiers must fall inside the domain rank.
+   * @param dim The dimension identifier to resolve.
+   * @return An `mdio::Result` object containing the zero-based position, or
+   * InvalidArgumentError if the label does not exist in the domain or the
+   * index is out of range.
+   */
+  Result<std::size_t> ResolveDimensionPosition(
+      const DimensionIdentifier& dim) const {
+    const auto labels = store.domain().labels();
+    if (dim.label().data() != nullptr) {
+      for (std::size_t position = 0; position < labels.size(); ++position) {
+        if (labels[position] == dim) {
+          return position;
+        }
+      }
+      return absl::InvalidArgumentError(
+          absl::StrCat("Dimension \"", dim.label(),
+                       "\" does not exist in variable ", variableName, "."));
+    }
+    const auto index = dim.index();
+    if (index < 0 || static_cast<std::size_t>(index) >= labels.size()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Dimension index ", index, " is out of range for variable ",
+          variableName, " of rank ", labels.size(), "."));
+    }
+    return static_cast<std::size_t>(index);
+  }
+
   // delegate the I/O to the tensorstore
   tensorstore::TensorStore<T, R, M> store;
 };
@@ -1992,6 +2156,187 @@ Result<VariableData<T, R, OriginKind>> from_variable(
   return VariableData<T, R, OriginKind>{
       variable.get_variable_name(), variable.get_long_name(),
       variable.getReducedMetadata(), std::move(labeled_array)};
+}
+
+namespace internal {
+
+/**
+ * @brief One accumulation pass over a flat, C-contiguous buffer.
+ *
+ * Accumulates the scalar stats and, when bin edges are supplied, the
+ * histogram counts. NaN values are skipped for floating point types.
+ * @tparam T The element type of the buffer.
+ * @param data Pointer to the first element of the buffer.
+ * @param numElements Number of elements in the buffer.
+ * @param binUpperEdges Midpoints between bin centers, or null to skip
+ * histogramming.
+ * @param scalars The scalar accumulator, or null to skip scalar accumulation.
+ * @param binCounts The per-bin counts to fill, or null to skip histogramming.
+ */
+template <typename T>
+void AccumulateStatsPass(const void* data, const std::size_t numElements,
+                         const std::vector<double>* binUpperEdges,
+                         StatsAccumulator* scalars,
+                         std::vector<int64_t>* binCounts) {
+  const T* values = static_cast<const T*>(data);
+  for (std::size_t index = 0; index < numElements; ++index) {
+    if constexpr (std::is_floating_point_v<T>) {
+      if (std::isnan(values[index])) {
+        continue;  // NaN is "missing", not a value.
+      }
+    }
+    const double value = static_cast<double>(values[index]);
+    if (scalars != nullptr) {
+      scalars->Add(value);
+    }
+    if (binUpperEdges != nullptr) {
+      ++(*binCounts)[BinIndexForValue(value, *binUpperEdges)];
+    }
+  }
+}
+
+/**
+ * @brief Runs AccumulateStatsPass with the buffer interpreted as the
+ * variable's dtype.
+ *
+ * @return OkStatus, or an error for dtypes ComputeStats does not support.
+ */
+inline absl::Status AccumulateStatsDispatch(
+    const void* data, const std::size_t numElements, const DataType dtype,
+    const std::vector<double>* binUpperEdges, StatsAccumulator* scalars,
+    std::vector<int64_t>* binCounts) {
+  if (dtype == constants::kFloat32) {
+    AccumulateStatsPass<dtypes::float32_t>(data, numElements, binUpperEdges,
+                                           scalars, binCounts);
+  } else if (dtype == constants::kFloat64) {
+    AccumulateStatsPass<dtypes::float64_t>(data, numElements, binUpperEdges,
+                                           scalars, binCounts);
+  } else if (dtype == constants::kInt8) {
+    AccumulateStatsPass<dtypes::int8_t>(data, numElements, binUpperEdges,
+                                        scalars, binCounts);
+  } else if (dtype == constants::kInt16) {
+    AccumulateStatsPass<dtypes::int16_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kInt32) {
+    AccumulateStatsPass<dtypes::int32_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kInt64) {
+    AccumulateStatsPass<dtypes::int64_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kUint8) {
+    AccumulateStatsPass<dtypes::uint8_t>(data, numElements, binUpperEdges,
+                                         scalars, binCounts);
+  } else if (dtype == constants::kUint16) {
+    AccumulateStatsPass<dtypes::uint16_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else if (dtype == constants::kUint32) {
+    AccumulateStatsPass<dtypes::uint32_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else if (dtype == constants::kUint64) {
+    AccumulateStatsPass<dtypes::uint64_t>(data, numElements, binUpperEdges,
+                                          scalars, binCounts);
+  } else {
+    return absl::InvalidArgumentError(
+        "ComputeStats does not support dtype '" +
+        std::string(dtype.name()) +
+        "'. Supported dtypes are float32, float64, and the signed/unsigned "
+        "integer types.");
+  }
+  return absl::OkStatus();
+}
+
+/**
+ * @brief Shared implementation of the two ComputeStats overloads.
+ *
+ * Reads the whole variable into memory (tensorstore::Read returns a
+ * C-contiguous array), accumulates the scalar stats, and histograms either
+ * in the same pass (explicit bin centers) or in a second pass (default bins
+ * derived from the data range).
+ */
+inline Result<SummaryStats> ComputeStatsImpl(
+    const Variable<>& var, absl::Span<const float> binCenters) {
+  MDIO_ASSIGN_OR_RETURN(auto array,
+                        tensorstore::Read(var.get_store()).result());
+  // tensorstore::Read allocates a fresh C-contiguous array, so a flat walk
+  // from the origin pointer covers every element.
+  const std::size_t numElements =
+      static_cast<std::size_t>(array.num_elements());
+  const void* data = array.byte_strided_origin_pointer().get();
+
+  StatsAccumulator scalars;
+  std::vector<int64_t> binCounts;
+
+  if (!binCenters.empty()) {
+    for (std::size_t index = 1; index < binCenters.size(); ++index) {
+      if (binCenters[index] <= binCenters[index - 1]) {
+        return absl::InvalidArgumentError(
+            "ComputeStats: bin centers must be strictly increasing.");
+      }
+    }
+    const std::vector<double> upperEdges = BinUpperEdges(binCenters);
+    binCounts.assign(binCenters.size(), 0);
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
+        data, numElements, var.dtype(), &upperEdges, &scalars, &binCounts));
+  } else {
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(data, numElements, var.dtype(),
+                                                 nullptr, &scalars, nullptr));
+  }
+
+  if (scalars.count == 0) {
+    // The canonical empty statsV1 (mdio-python convention).
+    return SummaryStats::Create(
+        0, 0.0F, 0.0F, 0.0F, 0.0F,
+        std::make_unique<CenteredBinHistogram<float>>(std::vector<float>(),
+                                                      std::vector<int32_t>()));
+  }
+
+  if (scalars.count >
+      static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    return absl::InvalidArgumentError(
+        "ComputeStats: count " + std::to_string(scalars.count) +
+        " exceeds the int32 statsV1 count field.");
+  }
+  MDIO_ASSIGN_OR_RETURN(const float sumValue,
+                        CheckedFloat(scalars.sum, "sum"));
+  MDIO_ASSIGN_OR_RETURN(const float sumSquaresValue,
+                        CheckedFloat(scalars.sumSquares, "sumSquares"));
+  MDIO_ASSIGN_OR_RETURN(const float minValue, CheckedFloat(scalars.min, "min"));
+  MDIO_ASSIGN_OR_RETURN(const float maxValue, CheckedFloat(scalars.max, "max"));
+
+  std::vector<float> centers(binCenters.begin(), binCenters.end());
+  if (centers.empty()) {
+    if (scalars.min == scalars.max) {
+      // A constant variable gets a single bin; equal-width bins over a zero
+      // range would all share the same center.
+      centers.push_back(minValue);
+    } else {
+      centers = UniformBinCenters(scalars.min, scalars.max,
+                                  kDefaultHistogramBinCount);
+    }
+    const std::vector<double> upperEdges = BinUpperEdges(centers);
+    binCounts.assign(centers.size(), 0);
+    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
+        data, numElements, var.dtype(), &upperEdges, nullptr, &binCounts));
+  }
+
+  // Per-bin counts cannot overflow int32: each is at most the total count.
+  const std::vector<int32_t> counts(binCounts.begin(), binCounts.end());
+  auto histogram = std::make_unique<CenteredBinHistogram<float>>(centers,
+                                                                 counts);
+  return SummaryStats::Create(static_cast<int32_t>(scalars.count), maxValue,
+                              minValue, sumValue, sumSquaresValue,
+                              std::move(histogram));
+}
+
+}  // namespace internal
+
+inline Result<internal::SummaryStats> ComputeStats(const Variable<>& var) {
+  return internal::ComputeStatsImpl(var, {});
+}
+
+inline Result<internal::SummaryStats> ComputeStats(
+    const Variable<>& var, absl::Span<const float> binCenters) {
+  return internal::ComputeStatsImpl(var, binCenters);
 }
 };  // namespace mdio
 #endif  // MDIO_VARIABLE_H_

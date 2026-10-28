@@ -993,6 +993,350 @@ TEST(ZarrV3, BuildVariableSpec_S3) {
   EXPECT_EQ(spec["kvstore"]["path"], "nested/path/amplitude");
 }
 
+// =============================================================================
+// V3 Variable Index Tests
+// =============================================================================
+
+TEST(ZarrV3, ExtractVariableNames_FromSpecPaths) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/inline"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/crossline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic", "inline", "crossline"));
+}
+
+TEST(ZarrV3, ExtractVariableNames_Deduplicates) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic"));
+}
+
+TEST(ZarrV3, ExtractVariableNames_TrailingSlashSkipped) {
+  // A path ending in '/' has no variable name as its last component; such a
+  // spec cannot be indexed and is skipped.
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/seismic/"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/inline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("inline"));
+}
+
+// Malformed specs (missing kvstore, missing/non-string path, non-object
+// spec) are skipped, not UB/throw: the index is best-effort at write time.
+TEST(ZarrV3, ExtractVariableNames_SkipsMalformedSpecs) {
+  std::vector<nlohmann::json> specs = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": "/store/seismic"}})"),
+      nlohmann::json::parse(R"({"not_a_kvstore": true})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"path": 42}})"),
+      nlohmann::json::parse(R"({"kvstore": "file"})"),
+      nlohmann::json::parse(R"("just a string")"),
+      nlohmann::json::parse(R"({"kvstore": {"path": "/store/inline"}})"),
+  };
+
+  auto names = mdio::zarr::v3::ExtractVariableNames(specs);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic", "inline"));
+}
+
+TEST(ZarrV3, ExtractVariableIndex_Valid) {
+  auto root = nlohmann::json::parse(R"({
+      "zarr_format": 3,
+      "node_type": "group",
+      "attributes": {
+        "name": "test",
+        "_mdio_variable_index": ["seismic", "inline"]
+      }
+    })");
+
+  auto names = mdio::zarr::v3::ExtractVariableIndex(root);
+
+  EXPECT_THAT(names, testing::ElementsAre("seismic", "inline"));
+}
+
+TEST(ZarrV3, ExtractVariableIndex_MissingKeyFallsBack) {
+  auto root = nlohmann::json::parse(
+      R"({"zarr_format": 3, "node_type": "group",
+          "attributes": {"name": "test"}})");
+
+  EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
+}
+
+TEST(ZarrV3, ExtractVariableIndex_NoAttributesFallsBack) {
+  auto root = nlohmann::json::parse(
+      R"({"zarr_format": 3, "node_type": "group"})");
+
+  EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
+}
+
+TEST(ZarrV3, ExtractVariableIndex_NotAnArrayFallsBack) {
+  auto root = nlohmann::json::parse(R"({
+      "zarr_format": 3,
+      "node_type": "group",
+      "attributes": {"_mdio_variable_index": "seismic"}
+    })");
+
+  EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
+}
+
+TEST(ZarrV3, ExtractVariableIndex_EmptyArrayFallsBack) {
+  auto root = nlohmann::json::parse(R"({
+      "zarr_format": 3,
+      "node_type": "group",
+      "attributes": {"_mdio_variable_index": []}
+    })");
+
+  EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
+}
+
+TEST(ZarrV3, ExtractVariableIndex_NonStringEntryFallsBack) {
+  auto root = nlohmann::json::parse(R"({
+      "zarr_format": 3,
+      "node_type": "group",
+      "attributes": {"_mdio_variable_index": ["seismic", 42]}
+    })");
+
+  EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
+}
+
+namespace {
+
+// Writes a synthetic V3 store: a root zarr.json (with the variable index when
+// `indexed` is non-empty) plus one array zarr.json per entry in `variables`.
+// `extra` variables beyond `indexed` model store contents the index does not
+// list (the List path would discover them; the index path must not).
+void WriteSyntheticV3Store(const std::filesystem::path& dir,
+                           const std::vector<std::string>& indexed,
+                           const std::vector<std::string>& variables) {
+  std::filesystem::create_directories(dir);
+  nlohmann::json root = {{"zarr_format", 3},
+                         {"node_type", "group"},
+                         {"attributes", {{"name", "synthetic"}}}};
+  if (!indexed.empty()) {
+    root["attributes"][std::string(mdio::zarr::v3::kVariableIndexKey)] =
+        indexed;
+  }
+  std::ofstream root_file(dir / "zarr.json");
+  root_file << root.dump(4);
+
+  for (const auto& var : variables) {
+    std::filesystem::create_directories(dir / var);
+    nlohmann::json child = {
+        {"zarr_format", 3}, {"node_type", "array"}, {"data_type", "float32"}};
+    std::ofstream child_file(dir / var / "zarr.json");
+    child_file << child.dump(4);
+  }
+}
+
+// Opens a synthetic store through the V3 read path and returns the result.
+tensorstore::Result<std::tuple<nlohmann::json, std::vector<nlohmann::json>>>
+OpenSyntheticV3Store(const std::filesystem::path& dir) {
+  auto kvs_future = tensorstore::kvstore::Open(
+      {{"driver", "file"}, {"path", dir.string() + "/"}});
+  return mdio::zarr::v3::ReadMetadata(dir.string(), kvs_future).result();
+}
+
+// Variable names discovered in a ReadMetadata result, in discovery order.
+std::vector<std::string> DiscoveredVariableNames(
+    const std::vector<nlohmann::json>& specs) {
+  std::vector<std::string> names;
+  for (const auto& spec : specs) {
+    std::string path = spec["kvstore"]["path"].get<std::string>();
+    size_t slash = path.find_last_of('/');
+    names.push_back(slash == std::string::npos ? path
+                                               : path.substr(slash + 1));
+  }
+  return names;
+}
+
+}  // namespace
+
+TEST(ZarrV3, WriteMetadata_WritesVariableIndexToRoot) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_write_" + std::to_string(std::rand()));
+  std::filesystem::create_directories(tmpDir);
+
+  nlohmann::json dataset_metadata = {{"name", "index_test"}};
+  std::vector<nlohmann::json> json_variables = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": ")" +
+                            tmpDir.string() + R"(/seismic"}})"),
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": ")" +
+                            tmpDir.string() + R"(/inline"}})"),
+  };
+
+  auto write = mdio::zarr::v3::WriteMetadata(dataset_metadata, json_variables);
+  ASSERT_TRUE(write.result().ok()) << write.result().status();
+
+  // The root zarr.json on disk carries the index alongside the user
+  // attributes, and remains a valid V3 group document.
+  std::ifstream root_file(tmpDir / "zarr.json");
+  ASSERT_TRUE(root_file.good());
+  auto root = nlohmann::json::parse(root_file);
+  EXPECT_EQ(root["zarr_format"], 3);
+  EXPECT_EQ(root["node_type"], "group");
+  EXPECT_EQ(root["attributes"]["name"], "index_test");
+  EXPECT_THAT(root["attributes"]["_mdio_variable_index"],
+              testing::ElementsAre("seismic", "inline"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+TEST(ZarrV3, ReadMetadata_UsesIndexAndSkipsList) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_open_" + std::to_string(std::rand()));
+  // "decoy" exists on disk but is not in the index: the List path would
+  // discover it, so its absence from the result proves the List was skipped.
+  WriteSyntheticV3Store(tmpDir, {"seismic", "inline"},
+                        {"seismic", "inline", "decoy"});
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  auto [dataset_metadata, json_vars] = result.value();
+  EXPECT_THAT(DiscoveredVariableNames(json_vars),
+              testing::ElementsAre("seismic", "inline"));
+  // The index is internal bookkeeping and must not surface as dataset
+  // metadata.
+  EXPECT_FALSE(dataset_metadata.contains("_mdio_variable_index"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+TEST(ZarrV3, ReadMetadata_FallsBackToListWithoutIndex) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_no_index_" + std::to_string(std::rand()));
+  // No index (mdio-python / foreign / pre-index mdio-cpp store shape): the
+  // same store now must also discover the decoy via the List path.
+  WriteSyntheticV3Store(tmpDir, {}, {"seismic", "inline", "decoy"});
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  auto [dataset_metadata, json_vars] = result.value();
+  EXPECT_THAT(DiscoveredVariableNames(json_vars),
+              testing::UnorderedElementsAre("seismic", "inline", "decoy"));
+  EXPECT_FALSE(dataset_metadata.contains("_mdio_variable_index"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+// The variable index is authoritative for mdio-written stores: an indexed
+// variable whose metadata is missing fails the open naming the variable,
+// instead of silently opening an incomplete dataset.
+TEST(ZarrV3, ReadMetadata_IndexedVariableMissingFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_missing_" + std::to_string(std::rand()));
+  // The index lists "missing", but only "seismic" exists on disk.
+  WriteSyntheticV3Store(tmpDir, {"seismic", "missing"}, {"seismic"});
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("missing"));
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("missing/zarr.json"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+// Corrupt (unparseable) metadata for an indexed variable fails the open
+// the same way a missing one does.
+TEST(ZarrV3, ReadMetadata_IndexedVariableCorruptFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_corrupt_" + std::to_string(std::rand()));
+  WriteSyntheticV3Store(tmpDir, {"seismic", "corrupt"},
+                        {"seismic", "corrupt"});
+  {
+    std::ofstream corrupt_file(tmpDir / "corrupt" / "zarr.json");
+    corrupt_file << "{ not json";
+  }
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("corrupt"));
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("corrupt/zarr.json"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+// The index only ever lists variables (arrays); an indexed candidate that
+// turns out to be a group means the store diverges from its index, which
+// also fails the open. The List path keeps skipping groups leniently (see
+// ReadMetadata_FallsBackToListWithoutIndex).
+TEST(ZarrV3, ReadMetadata_IndexedNonArrayFails) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_index_group_" + std::to_string(std::rand()));
+  WriteSyntheticV3Store(tmpDir, {"seismic", "groupchild"},
+                        {"seismic", "groupchild"});
+  {
+    nlohmann::json group = {{"zarr_format", 3}, {"node_type", "group"}};
+    std::ofstream group_file(tmpDir / "groupchild" / "zarr.json");
+    group_file << group.dump(4);
+  }
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_FALSE(result.ok());
+  EXPECT_THAT(result.status().message(), testing::HasSubstr("groupchild"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
+TEST(ZarrV3, ReadMetadata_WriteThenOpenRoundTrip) {
+  auto tmpDir = std::filesystem::temp_directory_path() /
+                 ("zarr_v3_roundtrip_" + std::to_string(std::rand()));
+  std::filesystem::create_directories(tmpDir);
+
+  // Create the store with the real writer (root + index)...
+  nlohmann::json dataset_metadata = {{"name", "roundtrip"}};
+  std::vector<nlohmann::json> json_variables = {
+      nlohmann::json::parse(R"({"kvstore": {"driver": "file",
+                                        "path": ")" +
+                            tmpDir.string() + R"(/seismic"}})"),
+  };
+  auto write = mdio::zarr::v3::WriteMetadata(dataset_metadata, json_variables);
+  ASSERT_TRUE(write.result().ok()) << write.result().status();
+
+  // ...complete it the way the create flow does (the array driver writes the
+  // child zarr.json; the root written above must stay in place), then open.
+  // The stream must be closed before the open: an unflushed buffer leaves an
+  // empty file on disk that parses as nothing.
+  std::filesystem::create_directories(tmpDir / "seismic");
+  nlohmann::json child = {
+      {"zarr_format", 3}, {"node_type", "array"}, {"data_type", "float32"}};
+  {
+    std::ofstream child_file(tmpDir / "seismic" / "zarr.json");
+    child_file << child.dump(4);
+  }
+
+  auto result = OpenSyntheticV3Store(tmpDir);
+  ASSERT_TRUE(result.ok()) << result.status();
+
+  auto [metadata, json_vars] = result.value();
+  EXPECT_EQ(metadata["name"], "roundtrip");
+  EXPECT_THAT(DiscoveredVariableNames(json_vars),
+              testing::ElementsAre("seismic"));
+
+  std::filesystem::remove_all(tmpDir);
+}
+
 }  // namespace ZarrV3Tests
 
 // =============================================================================

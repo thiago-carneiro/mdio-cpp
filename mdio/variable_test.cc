@@ -20,8 +20,10 @@
 #include <cmath>  // For checking NaN values
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 #include "mdio/zarr/zarr.h"
@@ -62,9 +64,15 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
 
 /**
  * @brief Creates a variable spec for testing based on Zarr version.
+ *
+ * The defaults reproduce the historical two-dimensional "x"/"y" spec; pass
+ * dimension_names/shape/chunks to build a different grid.
  */
-::nlohmann::json CreateTestVariableSpec(mdio::zarr::ZarrVersion version,
-                                        const std::string& name) {
+::nlohmann::json CreateTestVariableSpec(
+    mdio::zarr::ZarrVersion version, const std::string& name,
+    const std::vector<std::string>& dimension_names = {"x", "y"},
+    const std::vector<mdio::Index>& shape = {500, 500},
+    const std::vector<mdio::Index>& chunks = {100, 50}) {
   nlohmann::json spec;
   spec["driver"] = GetTestDriverName(version);
   spec["kvstore"]["driver"] = "file";
@@ -72,10 +80,9 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
 
   if (version == mdio::zarr::ZarrVersion::kV3) {
     spec["metadata"]["data_type"] = "int16";
-    spec["metadata"]["shape"] = nlohmann::json::array({500, 500});
+    spec["metadata"]["shape"] = shape;
     spec["metadata"]["chunk_grid"]["name"] = "regular";
-    spec["metadata"]["chunk_grid"]["configuration"]["chunk_shape"] =
-        nlohmann::json::array({100, 50});
+    spec["metadata"]["chunk_grid"]["configuration"]["chunk_shape"] = chunks;
     spec["metadata"]["chunk_key_encoding"]["name"] = "default";
     spec["metadata"]["chunk_key_encoding"]["configuration"]["separator"] = "/";
     nlohmann::json bytes_codec;
@@ -85,18 +92,18 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
     spec["attributes"]["metadata"]["attributes"]["project code"] = "fail";
     spec["attributes"]["metadata"]["unitsV1"] = {"m", "ft"};
     spec["attributes"]["long_name"] = "foooooo .....";
-    spec["attributes"]["dimension_names"] = {"x", "y"};
+    spec["attributes"]["dimension_names"] = dimension_names;
   } else {
     spec["metadata"]["compressor"]["id"] = "blosc";
     spec["metadata"]["dtype"] = "<i2";
-    spec["metadata"]["shape"] = {500, 500};
-    spec["metadata"]["chunks"] = {100, 50};
+    spec["metadata"]["shape"] = shape;
+    spec["metadata"]["chunks"] = chunks;
     spec["metadata"]["dimension_separator"] = "/";
     spec["attributes"]["metadata"]["attributes"]["job status"] = "win";
     spec["attributes"]["metadata"]["attributes"]["project code"] = "fail";
     spec["attributes"]["metadata"]["unitsV1"] = {"m", "ft"};
     spec["attributes"]["long_name"] = "foooooo .....";
-    spec["attributes"]["dimension_names"] = {"x", "y"};
+    spec["attributes"]["dimension_names"] = dimension_names;
   }
 
   return spec;
@@ -849,6 +856,28 @@ TEST(Variable, outOfBoundsSlice) {
   EXPECT_TRUE(legal.status().ok()) << legal.status();
 }
 
+// A descriptor past the end of the domain is clamped before the start > stop
+// precondition is checked, so the error must report the clamped values that
+// actually failed the check, not the original descriptor values.
+TEST(Variable, sliceErrorReportsClampedDescriptor) {
+  auto json_spec = json_good;
+  json_spec["metadata"]["shape"] = {383, 383};
+  json_spec["kvstore"]["path"] = "slice_error_clamped";
+
+  auto var =
+      mdio::Variable<>::Open(json_spec, mdio::constants::kCreateClean).result();
+  ASSERT_TRUE(var.ok()) << var.status();
+
+  mdio::RangeDescriptor<mdio::Index> past_end = {"x", 400, 500, 1};
+  auto result = var.value().slice(past_end);
+  ASSERT_FALSE(result.status().ok());
+
+  EXPECT_THAT(result.status().message(),
+              ::testing::HasSubstr("start=400 > stop=383"));
+  EXPECT_THAT(result.status().message(),
+              ::testing::Not(::testing::HasSubstr("stop=500")));
+}
+
 TEST(Variable, noIntervals) {
   auto varRes =
       mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
@@ -1346,6 +1375,167 @@ TEST(VariableData, fromVariableFillTest) {
 }
 
 // ============================================================================
+// ChunkRange / Variable::chunks() tests
+// ============================================================================
+
+namespace {
+
+/**
+ * @brief Sum of per-chunk element counts; must equal the domain volume.
+ */
+mdio::Index TotalChunkElements(const mdio::ChunkRange& chunks) {
+  mdio::Index total = 0;
+  for (const auto& chunk : chunks) {
+    total += chunk.num_elements();
+  }
+  return total;
+}
+
+/**
+ * @brief True if the box is a non-empty subset of the half-open domain.
+ */
+bool BoxWithinDomain(const tensorstore::Box<>& box,
+                     const std::vector<mdio::Index>& domain_origin,
+                     const std::vector<mdio::Index>& domain_shape) {
+  for (std::size_t i = 0; i < domain_origin.size(); ++i) {
+    if (box.shape()[i] <= 0) {
+      return false;
+    }
+    if (box.origin()[i] < domain_origin[i]) {
+      return false;
+    }
+    if (box.origin()[i] + box.shape()[i] > domain_origin[i] + domain_shape[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST(ChunkRange, edgeChunksArePartial) {
+  // 10, 7 and 3 are not divisible by 4, 3 and 5: every dimension has a
+  // partial edge chunk.
+  auto chunks = mdio::ChunkRange::Create({0, 0, 0}, {10, 7, 3}, {4, 3, 5});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  EXPECT_EQ(chunks->size(), 9);  // ceil(10/4) * ceil(7/3) * ceil(3/5) = 3*3*1
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(0, 0, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(4, 3, 3));
+
+  // Row-major: the last chunk is the partial edge along every dimension.
+  auto last = chunks->begin();
+  for (std::size_t i = 1; i < chunks->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(8, 6, 0));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(2, 1, 3));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {0, 0, 0}, {10, 7, 3}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 10 * 7 * 3);
+}
+
+TEST(ChunkRange, rank1Through4) {
+  // Rank 1: partial edge chunk [8, 10).
+  auto rank1 = mdio::ChunkRange::Create({0}, {10}, {4});
+  ASSERT_TRUE(rank1.ok()) << rank1.status();
+  EXPECT_EQ(rank1->size(), 3);
+  EXPECT_EQ(TotalChunkElements(*rank1), 10);
+
+  // Rank 2: chunk larger than the first dimension collapses it to one chunk.
+  auto rank2 = mdio::ChunkRange::Create({0, 0}, {5, 6}, {5, 4});
+  ASSERT_TRUE(rank2.ok()) << rank2.status();
+  EXPECT_EQ(rank2->size(), 2);
+  EXPECT_EQ(TotalChunkElements(*rank2), 5 * 6);
+
+  // Rank 3.
+  auto rank3 = mdio::ChunkRange::Create({0, 0, 0}, {3, 4, 5}, {2, 2, 3});
+  ASSERT_TRUE(rank3.ok()) << rank3.status();
+  EXPECT_EQ(rank3->size(), 8);
+  EXPECT_EQ(TotalChunkElements(*rank3), 3 * 4 * 5);
+
+  // Rank 4.
+  auto rank4 =
+      mdio::ChunkRange::Create({0, 0, 0, 0}, {2, 3, 4, 5}, {1, 2, 2, 3});
+  ASSERT_TRUE(rank4.ok()) << rank4.status();
+  EXPECT_EQ(rank4->size(), 16);
+  EXPECT_EQ(TotalChunkElements(*rank4), 2 * 3 * 4 * 5);
+}
+
+TEST(ChunkRange, offsetDomainBoxesAreAbsolute) {
+  // A sliced variable's domain carries an offset (fix 4 semantics): the grid
+  // is anchored at the domain origin and boxes stay inside the domain.
+  auto chunks = mdio::ChunkRange::Create({83, 0}, {250, 500}, {100, 50});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  EXPECT_EQ(chunks->size(), 30);  // ceil(250/100) * ceil(500/50)
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {83, 0}, {250, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 250 * 500);
+}
+
+TEST(ChunkRange, rejectsInvalidGrids) {
+  // Zero-sized domain dimension.
+  auto zero_dim = mdio::ChunkRange::Create({0, 0}, {500, 0}, {100, 50});
+  EXPECT_FALSE(zero_dim.ok());
+
+  // Non-positive chunk size.
+  auto zero_chunk = mdio::ChunkRange::Create({0, 0}, {500, 500}, {100, 0});
+  EXPECT_FALSE(zero_chunk.ok());
+
+  // Rank mismatch between domain and chunk shape.
+  auto rank_mismatch =
+      mdio::ChunkRange::Create({0, 0}, {500, 500, 1}, {100, 50});
+  EXPECT_FALSE(rank_mismatch.ok());
+}
+
+TEST(ChunkRange, stlCompatibility) {
+  auto chunks = mdio::ChunkRange::Create({0, 0}, {10, 10}, {4, 4});
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  // Range-based for loop.
+  std::size_t count = 0;
+  for (const auto& chunk : *chunks) {
+    (void)chunk;
+    ++count;
+  }
+  EXPECT_EQ(count, chunks->size());  // 3 * 3
+
+  // std::distance over the iterator pair.
+  EXPECT_EQ(
+      static_cast<std::size_t>(std::distance(chunks->begin(), chunks->end())),
+      chunks->size());
+
+  // Iterator trait surface and category.
+  static_assert(std::is_same<mdio::ChunkIterator::iterator_category,
+                             std::forward_iterator_tag>::value,
+                "ChunkIterator must be a forward iterator");
+  static_assert(
+      std::is_same<mdio::ChunkIterator::value_type, tensorstore::Box<>>::value,
+      "ChunkIterator must yield tensorstore::Box");
+
+  // Copies iterate independently (multi-pass).
+  auto first = chunks->begin();
+  auto copy = first;
+  ++first;
+  ++first;
+  EXPECT_EQ(copy.current_chunk_index(), 0);
+  EXPECT_EQ(first.current_chunk_index(), 2);
+  EXPECT_NE(first, chunks->begin());
+  EXPECT_EQ(copy, chunks->begin());
+}
+
+// ============================================================================
 // Parameterized Variable Tests for V2/V3
 // ============================================================================
 
@@ -1466,6 +1656,236 @@ TEST_P(VariableVersionTest, outOfBoundsSlice) {
   auto badDomain = outbounds.value();
   EXPECT_THAT(badDomain.dimensions().shape(), ::testing::ElementsAre(250, 500))
       << badDomain.dimensions();
+}
+
+TEST_P(VariableVersionTest, chunks) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // Stored chunk shape is [100, 50] on a [500, 500] domain: 5 * 10 chunks.
+  auto chunks = variable.chunks();
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+  EXPECT_EQ(chunks->size(), 50);
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(0, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  // Row-major traversal: chunk 11 is the second chunk along both dimensions.
+  auto second_row = chunks->begin();
+  for (std::size_t i = 0; i < 11; ++i) {
+    ++second_row;
+  }
+  EXPECT_THAT(second_row->origin(), ::testing::ElementsAre(100, 50));
+  EXPECT_THAT(second_row->shape(), ::testing::ElementsAre(100, 50));
+
+  // Every box stays inside the domain and the boxes tile it exactly.
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {0, 0}, {500, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 500 * 500);
+
+  // The boxes are ready for Variable::slice(): slicing by the first box
+  // yields a variable whose domain matches the box.
+  mdio::RangeDescriptor<mdio::Index> desc1 = {
+      "x", first->origin()[0], first->origin()[0] + first->shape()[0], 1};
+  mdio::RangeDescriptor<mdio::Index> desc2 = {
+      "y", first->origin()[1], first->origin()[1] + first->shape()[1], 1};
+  auto sliced = variable.slice(desc1, desc2);
+  ASSERT_TRUE(sliced.ok()) << sliced.status();
+  EXPECT_THAT(sliced->dimensions().origin(), ::testing::ElementsAre(0, 0));
+  EXPECT_THAT(sliced->dimensions().shape(), ::testing::ElementsAre(100, 50));
+}
+
+TEST_P(VariableVersionTest, chunksOnSlicedOffsetDomain) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // Slice x to [83, 333): the domain carries an offset (fix 4 semantics).
+  mdio::RangeDescriptor<mdio::Index> desc = {"x", 83, 333, 1};
+  auto sliced = variable.slice(desc);
+  ASSERT_TRUE(sliced.ok()) << sliced.status();
+  EXPECT_THAT(sliced->dimensions().origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(sliced->dimensions().shape(), ::testing::ElementsAre(250, 500));
+
+  auto chunks = sliced->chunks();
+  ASSERT_TRUE(chunks.ok()) << chunks.status();
+
+  // Grid anchored at the offset domain origin: 3 chunks along x (the last
+  // one partial: [283, 333)) and 10 along y.
+  EXPECT_EQ(chunks->size(), 30);
+
+  auto first = chunks->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(83, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(100, 50));
+
+  auto last = chunks->begin();
+  for (std::size_t i = 1; i < chunks->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(283, 450));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(50, 50));
+
+  for (const auto& chunk : *chunks) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {83, 0}, {250, 500}));
+  }
+  EXPECT_EQ(TotalChunkElements(*chunks), 250 * 500);
+}
+
+TEST_P(VariableVersionTest, chunksRejectsZeroSizedDimension) {
+  auto spec = CreateTestVariableSpec(version_, base_path_);
+  spec["metadata"]["shape"] = nlohmann::json::array({500, 0});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).result();
+  ASSERT_TRUE(variable.ok()) << variable.status();
+
+  auto chunks = variable->chunks();
+  ASSERT_FALSE(chunks.ok());
+  EXPECT_EQ(chunks.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST_P(VariableVersionTest, chunksDimensionSubsetProjectsFullExtent) {
+  // Rank 3 with partial edges on every dimension: the full grid has
+  // 3 * 3 * 4 = 36 chunks; the subset grid must collapse time to one chunk.
+  auto spec = CreateTestVariableSpec(version_, base_path_,
+                                     {"inline", "crossline", "time"},
+                                     {10, 7, 30}, {4, 3, 8});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  auto full = variable.chunks();
+  ASSERT_TRUE(full.ok()) << full.status();
+  EXPECT_EQ(full->size(), 36);
+
+  auto spatial = variable.chunks("inline", "crossline");
+  ASSERT_TRUE(spatial.ok()) << spatial.status();
+  // Product of the named dimensions' grids only: ceil(10/4) * ceil(7/3) = 9.
+  EXPECT_EQ(spatial->size(), 9);
+
+  auto first = spatial->begin();
+  EXPECT_THAT(first->origin(), ::testing::ElementsAre(0, 0, 0));
+  EXPECT_THAT(first->shape(), ::testing::ElementsAre(4, 3, 30));
+
+  // Row-major over the named dimensions: the 5th box is chunk (1, 1).
+  auto fifth = spatial->begin();
+  for (std::size_t i = 1; i < 5; ++i) {
+    ++fifth;
+  }
+  EXPECT_THAT(fifth->origin(), ::testing::ElementsAre(4, 3, 0));
+  EXPECT_THAT(fifth->shape(), ::testing::ElementsAre(4, 3, 30));
+
+  // Last box: partial edge chunks on both named dimensions, full time.
+  auto last = spatial->begin();
+  for (std::size_t i = 1; i < spatial->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(8, 6, 0));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(2, 1, 30));
+
+  for (const auto& chunk : *spatial) {
+    EXPECT_TRUE(BoxWithinDomain(chunk, {0, 0, 0}, {10, 7, 30}));
+    // The dimension left out of the subset is covered at full extent.
+    EXPECT_EQ(chunk.origin()[2], 0);
+    EXPECT_EQ(chunk.shape()[2], 30);
+  }
+  // The projected grid still tiles the domain exactly.
+  EXPECT_EQ(TotalChunkElements(*spatial), 10 * 7 * 30);
+
+  // Index form addresses the same dimensions as the labels.
+  auto by_index = variable.chunks(0, 1);
+  ASSERT_TRUE(by_index.ok()) << by_index.status();
+  EXPECT_EQ(by_index->size(), 9);
+}
+
+TEST_P(VariableVersionTest, chunksDimensionSubsetSingleNamedDimension) {
+  auto spec = CreateTestVariableSpec(version_, base_path_,
+                                     {"inline", "crossline", "time"},
+                                     {10, 7, 30}, {4, 3, 8});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // One named dimension: full extent on BOTH dimensions left out.
+  auto inlines = variable.chunks("inline");
+  ASSERT_TRUE(inlines.ok()) << inlines.status();
+  EXPECT_EQ(inlines->size(), 3);
+  for (const auto& chunk : *inlines) {
+    EXPECT_EQ(chunk.shape()[1], 7);
+    EXPECT_EQ(chunk.shape()[2], 30);
+  }
+  auto last = inlines->begin();
+  for (std::size_t i = 1; i < inlines->size(); ++i) {
+    ++last;
+  }
+  EXPECT_THAT(last->origin(), ::testing::ElementsAre(8, 0, 0));
+  EXPECT_THAT(last->shape(), ::testing::ElementsAre(2, 7, 30));
+
+  // Naming the time dimension iterates its 4 chunk positions, each covering
+  // the full spatial extent; the last one is a partial edge chunk.
+  auto times = variable.chunks("time");
+  ASSERT_TRUE(times.ok()) << times.status();
+  EXPECT_EQ(times->size(), 4);
+  auto time_last = times->begin();
+  for (std::size_t i = 1; i < times->size(); ++i) {
+    ++time_last;
+  }
+  EXPECT_THAT(time_last->origin(), ::testing::ElementsAre(0, 0, 24));
+  EXPECT_THAT(time_last->shape(), ::testing::ElementsAre(10, 7, 6));
+}
+
+TEST_P(VariableVersionTest, chunksDimensionSubsetRank1MatchesFullGrid) {
+  // Rank 1: naming the only dimension is the trivial projection — the
+  // subset grid must equal the full grid box for box.
+  auto spec = CreateTestVariableSpec(version_, base_path_, {"time"}, {10}, {4});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  auto subset = variable.chunks("time");
+  ASSERT_TRUE(subset.ok()) << subset.status();
+  auto full = variable.chunks();
+  ASSERT_TRUE(full.ok()) << full.status();
+
+  ASSERT_EQ(subset->size(), full->size());
+  EXPECT_EQ(subset->size(), 3);  // Partial edge chunk [8, 10).
+  auto subset_it = subset->begin();
+  auto full_it = full->begin();
+  for (std::size_t i = 0; i < subset->size(); ++i, ++subset_it, ++full_it) {
+    EXPECT_THAT(subset_it->origin(),
+                ::testing::ElementsAre(full_it->origin()[0]));
+    EXPECT_THAT(subset_it->shape(),
+                ::testing::ElementsAre(full_it->shape()[0]));
+  }
+  EXPECT_EQ(TotalChunkElements(*subset), 10);
+}
+
+TEST_P(VariableVersionTest, chunksDimensionSubsetRejectsInvalidDimensions) {
+  auto spec = CreateTestVariableSpec(version_, base_path_,
+                                     {"inline", "crossline", "time"},
+                                     {10, 7, 30}, {4, 3, 8});
+  auto variable =
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean).value();
+
+  // Label that does not exist in the domain.
+  auto missing = variable.chunks("inline", "depth");
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.status().code(), absl::StatusCode::kInvalidArgument);
+
+  // Same dimension named twice (label and index form resolve to position 0).
+  auto repeated = variable.chunks("inline", 0);
+  ASSERT_FALSE(repeated.ok());
+  EXPECT_EQ(repeated.status().code(), absl::StatusCode::kInvalidArgument);
+
+  // Index outside the domain rank.
+  auto out_of_range = variable.chunks(3);
+  ASSERT_FALSE(out_of_range.ok());
+  EXPECT_EQ(out_of_range.status().code(), absl::StatusCode::kInvalidArgument);
+
+  // Empty subset: the full grid is chunks(); an explicit empty list is an
+  // error.
+  auto empty = variable.chunks(std::vector<mdio::DimensionIdentifier>{});
+  ASSERT_FALSE(empty.ok());
+  EXPECT_EQ(empty.status().code(), absl::StatusCode::kInvalidArgument);
 }
 
 INSTANTIATE_TEST_SUITE_P(

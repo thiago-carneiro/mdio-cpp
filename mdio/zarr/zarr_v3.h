@@ -59,6 +59,25 @@ constexpr std::string_view kGroupNodeType = "group";
  */
 constexpr std::string_view kArrayNodeType = "array";
 
+/**
+ * @brief The attributes key holding the variable index in the root zarr.json.
+ *
+ * Site decision: the index lives INSIDE `attributes`, not in a dedicated
+ * root-level field. The Zarr V3 core spec defines `attributes` as free-form
+ * ("The object may contain any key/value pairs ... arbitrary user metadata"),
+ * so every reader (zarr-python, mdio-python, older mdio-cpp) tolerates it.
+ * A dedicated root-level field, in contrast, hits the spec's unknown-field
+ * rule ("An implementation MUST fail to open Zarr groups or arrays if any
+ * metadata fields are present which the implementation does not recognize
+ * and ... are not explicitly set to must_understand: false"), and the spec
+ * explicitly discourages `must_understand: false` for top-level keys. The
+ * spec's `consolidated_metadata` field was rejected because its `metadata`
+ * member must hold full child metadata documents, which would duplicate
+ * every variable's zarr.json in the root while mdio's open path re-reads
+ * each `NAME/zarr.json` anyway (the TensorStore spec points at it).
+ */
+constexpr std::string_view kVariableIndexKey = "_mdio_variable_index";
+
 // ============================================================================
 // V3-Specific JSON Utilities
 // ============================================================================
@@ -198,6 +217,79 @@ inline std::vector<std::string> ExtractChildArrayCandidates(
     }
   }
   return candidates;
+}
+
+/**
+ * @brief Extracts the variable names from the variable specs.
+ *
+ * Every spec source (dataset_factory's `from_json_to_spec`, CommitMetadata's
+ * rebuilt specs, HeaderVariable's `ToCommitJson`) lays out `kvstore.path` as
+ * `<dataset path>/<variable name>` with no trailing slash, so the variable
+ * name is the last path component. Names are returned in spec order, deduped
+ * (the List-based discovery path dedupes too, keeping both discovery paths
+ * behaviorally identical).
+ *
+ * Specs without a well-formed `kvstore.path` (missing or non-string) are
+ * skipped: the index is best-effort at write time, and the authoritative
+ * open path reports indexed variables that cannot be read (see
+ * V3MetadataState::BuildVariableSpecs).
+ *
+ * @param json_variables The variable JSON specs being written.
+ * @return Vector of unique variable names in declaration order.
+ */
+inline std::vector<std::string> ExtractVariableNames(
+    const std::vector<nlohmann::json>& json_variables) {
+  std::vector<std::string> names;
+  for (const auto& json : json_variables) {
+    if (!json.contains("kvstore") ||
+        !json["kvstore"].contains("path") ||
+        !json["kvstore"]["path"].is_string()) {
+      continue;
+    }
+    const std::string path = json["kvstore"]["path"].get<std::string>();
+    std::vector<std::string> parts = absl::StrSplit(path, '/');
+    if (parts.empty() || parts.back().empty()) {
+      continue;
+    }
+    if (std::find(names.begin(), names.end(), parts.back()) == names.end()) {
+      names.push_back(parts.back());
+    }
+  }
+  return names;
+}
+
+/**
+ * @brief Extracts the variable index from a root zarr.json.
+ *
+ * Returns the indexed variable names, or an empty vector when the store has
+ * no usable index (key absent, not an array, empty, or any non-string entry)
+ * -- the caller then falls back to listing the store, which is the behavior
+ * for mdio-python, foreign, and pre-index mdio-cpp stores.
+ *
+ * @param root_json The parsed root zarr.json content.
+ * @return Vector of indexed variable names; empty when absent or malformed.
+ */
+inline std::vector<std::string> ExtractVariableIndex(
+    const nlohmann::json& root_json) {
+  std::vector<std::string> names;
+  if (!root_json.contains("attributes")) {
+    return names;
+  }
+  const auto& attributes = root_json["attributes"];
+  if (!attributes.is_object() || !attributes.contains(kVariableIndexKey)) {
+    return names;
+  }
+  const auto& index = attributes[kVariableIndexKey];
+  if (!index.is_array() || index.empty()) {
+    return names;
+  }
+  for (const auto& name : index) {
+    if (!name.is_string()) {
+      return {};
+    }
+    names.push_back(name.get<std::string>());
+  }
+  return names;
 }
 
 // ============================================================================
@@ -405,9 +497,18 @@ inline Future<void> WriteMetadata(
 
   auto kvs_future = tensorstore::kvstore::Open(kvstore, context);
 
-  // Create root metadata (variables are discovered via directory listing,
-  // not stored in zarr.json)
+  // Create root metadata with the variable index (see kVariableIndexKey for
+  // the site decision). The index lets the open path skip the full-store
+  // kvstore List, which on NFS costs one openat per file in the store; it is
+  // regenerated on every write (create and CommitMetadata both pass the full
+  // variable set through here), so mdio workflows keep it current. Stores
+  // mutated by non-mdio tooling must update or remove the index, or the
+  // changes stay invisible to index-based opens.
   auto root_metadata = CreateGroupMetadata(dataset_metadata);
+  auto variable_names = ExtractVariableNames(json_variables);
+  if (!variable_names.empty()) {
+    root_metadata["attributes"][kVariableIndexKey] = variable_names;
+  }
 
   auto root_future = tensorstore::MapFutureValue(
       tensorstore::InlineExecutor{},
@@ -475,6 +576,11 @@ struct V3MetadataState {
   KvStoreLocation location;
   std::vector<std::string> candidates;
   std::shared_ptr<std::vector<ReadFuture>> read_futures;
+  /// True when candidates came from the root variable index (mdio-written
+  /// stores) rather than a store List. On the index path every candidate
+  /// is a variable the writer committed to, so a candidate that does not
+  /// yield a variable spec fails the open instead of being skipped.
+  bool is_index_path = false;
 
   V3MetadataState(PromiseType p, KvStoreLocation loc)
       : promise(std::move(p)), location(std::move(loc)) {}
@@ -492,25 +598,66 @@ struct V3MetadataState {
     return BuildVariableSpec(std::string(kDriverName), location, var_name);
   }
 
+  /// Error for an indexed candidate that did not yield a variable spec.
+  /// Names the variable and its zarr.json path so the divergence between
+  /// the index and the store is actionable.
+  absl::Status IndexedVariableError(const std::string& var_name,
+                                    const std::string& reason) const {
+    return absl::InvalidArgumentError(
+        "Variable '" + var_name +
+        "' is listed in the variable index but its metadata " + reason +
+        ": " + location.path + var_name + "/zarr.json");
+  }
+
   /// Filters read results to build variable specs for arrays only.
-  std::vector<nlohmann::json> BuildVariableSpecs() const {
+  ///
+  /// On the List path, candidates are merely directories containing a
+  /// zarr.json: groups and unreadable children are legitimate store
+  /// contents and are skipped leniently. On the index path, candidates
+  /// are the variables the writer committed to (the index is
+  /// authoritative for mdio-written stores): a candidate whose metadata
+  /// cannot be read, parsed, or is not array metadata fails the open,
+  /// naming the variable, instead of silently dropping it.
+  Result<std::vector<nlohmann::json>> BuildVariableSpecs() const {
     std::vector<nlohmann::json> json_vars;
     for (size_t i = 0; i < candidates.size(); ++i) {
       const auto& result = (*read_futures)[i].result();
-      if (!result.ok() || !result->has_value()) continue;
+      if (!result.ok() || !result->has_value()) {
+        if (is_index_path) {
+          const std::string reason =
+              result.ok()
+                  ? "was not found"
+                  : "could not be read: " +
+                        std::string(result.status().message());
+          return IndexedVariableError(candidates[i], reason);
+        }
+        continue;
+      }
 
       auto parsed = ParseJsonFromReadResult(*result);
-      if (parsed.ok() && IsArrayMetadata(parsed.value())) {
-        if (parsed.value().contains("data_type") &&
-            IsMetadataOnlyDataType(parsed.value()["data_type"])) {
-          auto spec = MakeVariableSpec(candidates[i]);
-          spec["_mdio_header_only"] = true;
-          spec["_mdio_array_metadata"] = parsed.value();
-          json_vars.push_back(std::move(spec));
-          continue;
+      if (!parsed.ok()) {
+        if (is_index_path) {
+          return IndexedVariableError(
+              candidates[i],
+              "is not valid JSON: " + std::string(parsed.status().message()));
         }
-        json_vars.push_back(MakeVariableSpec(candidates[i]));
+        continue;
       }
+      if (!IsArrayMetadata(parsed.value())) {
+        if (is_index_path) {
+          return IndexedVariableError(candidates[i], "is not array metadata");
+        }
+        continue;
+      }
+      if (parsed.value().contains("data_type") &&
+          IsMetadataOnlyDataType(parsed.value()["data_type"])) {
+        auto spec = MakeVariableSpec(candidates[i]);
+        spec["_mdio_header_only"] = true;
+        spec["_mdio_array_metadata"] = parsed.value();
+        json_vars.push_back(std::move(spec));
+        continue;
+      }
+      json_vars.push_back(MakeVariableSpec(candidates[i]));
     }
     return json_vars;
   }
@@ -520,29 +667,22 @@ struct V3MetadataState {
 inline void OnV3ChildReadsComplete(std::shared_ptr<V3MetadataState> state,
                                    tensorstore::ReadyFuture<void>) {
   auto json_vars = state->BuildVariableSpecs();
-  if (json_vars.empty()) {
+  if (!json_vars.ok()) {
+    state->Fail(json_vars.status());
+    return;
+  }
+  if (json_vars->empty()) {
     state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
     return;
   }
-  state->Complete(std::move(json_vars));
+  state->Complete(std::move(*json_vars));
 }
 
 /// Step 3: Read all child zarr.json files and filter by node_type.
-inline void OnV3ListComplete(
-    std::shared_ptr<V3MetadataState> state,
-    tensorstore::ReadyFuture<std::vector<tensorstore::kvstore::ListEntry>>
-        list_ready) {
-  if (!list_ready.result().ok()) {
-    state->Fail(list_ready.result().status());
-    return;
-  }
-
-  state->candidates = ExtractChildArrayCandidates(list_ready.value());
-  if (state->candidates.empty()) {
-    state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
-    return;
-  }
-
+///
+/// Shared by the index path (candidates from the root variable index) and
+/// the List path (candidates from ExtractChildArrayCandidates).
+inline void ReadChildMetadata(std::shared_ptr<V3MetadataState> state) {
   // Read all child zarr.json files
   state->read_futures =
       std::make_shared<std::vector<V3MetadataState::ReadFuture>>();
@@ -560,7 +700,26 @@ inline void OnV3ListComplete(
   });
 }
 
-/// Step 2: Parse root metadata and list kvstore contents.
+/// Step 3 (List path): extract candidates from the list result and read them.
+inline void OnV3ListComplete(
+    std::shared_ptr<V3MetadataState> state,
+    tensorstore::ReadyFuture<std::vector<tensorstore::kvstore::ListEntry>>
+        list_ready) {
+  if (!list_ready.result().ok()) {
+    state->Fail(list_ready.result().status());
+    return;
+  }
+
+  state->candidates = ExtractChildArrayCandidates(list_ready.value());
+  if (state->candidates.empty()) {
+    state->Fail(absl::InvalidArgumentError("No Zarr V3 arrays found."));
+    return;
+  }
+
+  ReadChildMetadata(state);
+}
+
+/// Step 2: Parse root metadata and discover variables (index or List).
 inline void OnV3RootReadComplete(
     std::shared_ptr<V3MetadataState> state,
     tensorstore::ReadyFuture<tensorstore::kvstore::ReadResult> root_ready) {
@@ -576,7 +735,24 @@ inline void OnV3RootReadComplete(
   }
 
   state->dataset_metadata = GetJsonObject(root_json.value(), "attributes");
+  // The variable index is internal bookkeeping, not user metadata; remove it
+  // from the dataset metadata handed to the caller (GetJsonObject returns a
+  // copy, so this never touches the stored zarr.json).
+  state->dataset_metadata.erase(kVariableIndexKey);
 
+  // mdio-written stores carry the variable index in the root attributes: use
+  // it and skip the full-store List entirely (one openat per file in the
+  // store on NFS). The index is authoritative for mdio-written stores.
+  auto variable_index = ExtractVariableIndex(root_json.value());
+  if (!variable_index.empty()) {
+    state->candidates = std::move(variable_index);
+    state->is_index_path = true;
+    ReadChildMetadata(state);
+    return;
+  }
+
+  // No index (mdio-python, foreign, or pre-index mdio-cpp stores): discover
+  // variables by listing the store, as before.
   auto list_future = tensorstore::kvstore::ListFuture(state->kvs);
   list_future.ExecuteWhenReady(
       [state](
@@ -607,9 +783,11 @@ inline void OnV3KvStoreReady(
 /**
  * @brief Reads dataset metadata from Zarr V3 format (non-consolidated).
  *
- * For Zarr V3, we read the root zarr.json and then discover arrays
- * by listing the kvstore contents and checking each zarr.json for
- * node_type="array" (skipping groups).
+ * For Zarr V3, we read the root zarr.json and then discover arrays either
+ * from the variable index in the root attributes (mdio-written stores; skips
+ * the store List) or, when no index is present, by listing the kvstore
+ * contents and checking each zarr.json for node_type="array" (skipping
+ * groups).
  *
  * @param dataset_path The path to the dataset.
  * @param kvs_future A future to the KvStore.
