@@ -221,7 +221,9 @@ inline absl::Status ApplyElementTransform(const void* src_data, void* dst_data,
  * completed with the transform's first error — in which case no write is
  * submitted and the destination keeps its prior contents — or with the
  * write's commit result. The destination array is captured by the commit
- * callback and stays alive until the write commits.
+ * callback and stays alive until the write commits. An exception escaping
+ * this continuation (e.g. a failed allocation or a throwing user transform)
+ * is converted into the promise's result instead of terminating.
  *
  * @param dst The destination variable.
  * @param src_layout The source element layout.
@@ -235,32 +237,47 @@ inline void TransformAndWrite(
     const ElementLayout& dst_layout, const ElementTransform& fn,
     tensorstore::Promise<absl::Status> promise,
     const SharedArray<void, dynamic_rank, offset_origin>& src_array) {
-  auto dst_array = tensorstore::AllocateArray(
-      dst.get_store().domain().box(), mdio::ContiguousLayoutOrder::c,
-      tensorstore::value_init, dst.dtype());
-  absl::Status transformed = ApplyElementTransform(
-      src_array.byte_strided_origin_pointer().get(),
-      dst_array.byte_strided_origin_pointer().get(), src_layout, dst_layout,
-      dst.get_variable_name(), fn);
-  if (!transformed.ok()) {
-    // fn failed: no write is submitted, so dst keeps its prior contents.
-    promise.SetResult(std::move(transformed));
-    return;
+  // This continuation runs on the read future's callback thread. An
+  // exception escaping it (bad_alloc from the unchecked AllocateArray, or a
+  // throwing user transform) would terminate the process with this promise
+  // unfulfilled, hanging every waiter on TransformVariable's future.
+  // Convert any exception into the promise's result instead.
+  try {
+    auto dst_array = tensorstore::AllocateArray(
+        dst.get_store().domain().box(), mdio::ContiguousLayoutOrder::c,
+        tensorstore::value_init, dst.dtype());
+    absl::Status transformed = ApplyElementTransform(
+        src_array.byte_strided_origin_pointer().get(),
+        dst_array.byte_strided_origin_pointer().get(), src_layout, dst_layout,
+        dst.get_variable_name(), fn);
+    if (!transformed.ok()) {
+      // fn failed: no write is submitted, so dst keeps its prior contents.
+      promise.SetResult(std::move(transformed));
+      return;
+    }
+    tensorstore::Write(dst_array, dst.get_store())
+        .commit_future.ExecuteWhenReady(
+            [promise = std::move(promise), dst_array = std::move(dst_array)](
+                tensorstore::ReadyFuture<void> readyWrite) {
+              auto write_result = readyWrite.result();
+              if (!write_result.ok()) {
+                promise.SetResult(write_result.status());
+                return;
+              }
+              // Success is the future's VALUE: Result<absl::Status> rejects an
+              // ok Status in its error-argument form, so build it in place.
+              promise.SetResult(tensorstore::Result<absl::Status>(
+                  std::in_place, absl::OkStatus()));
+            });
+  } catch (const std::exception& e) {
+    promise.SetResult(absl::InternalError(absl::StrCat(
+        "TransformVariable for variable '", dst.get_variable_name(),
+        "' threw an exception: ", e.what())));
+  } catch (...) {
+    promise.SetResult(absl::InternalError(absl::StrCat(
+        "TransformVariable for variable '", dst.get_variable_name(),
+        "' threw a non-standard exception.")));
   }
-  tensorstore::Write(dst_array, dst.get_store())
-      .commit_future.ExecuteWhenReady(
-          [promise = std::move(promise), dst_array = std::move(dst_array)](
-              tensorstore::ReadyFuture<void> readyWrite) {
-            auto write_result = readyWrite.result();
-            if (!write_result.ok()) {
-              promise.SetResult(write_result.status());
-              return;
-            }
-            // Success is the future's VALUE: Result<absl::Status> rejects an
-            // ok Status in its error-argument form, so build it in place.
-            promise.SetResult(tensorstore::Result<absl::Status>(
-                std::in_place, absl::OkStatus()));
-          });
 }
 
 }  // namespace internal

@@ -351,8 +351,8 @@ class SummaryStats {
       return absl::InvalidArgumentError(
           "SummaryStats requires a histogram (may be empty, but not null).");
     }
-    return mdio::Result<SummaryStats>(SummaryStats(
-        count, max, min, sum, sumSquares, std::move(histogram)));
+    return mdio::Result<SummaryStats>(
+        SummaryStats(count, max, min, sum, sumSquares, std::move(histogram)));
   }
 
   /// @brief The number of data points.
@@ -726,10 +726,8 @@ inline absl::Status CheckBinningCompatibility(
     sameBinning =
         histogramJson["binCenters"] == referenceHistogram["binCenters"];
   } else if (sameKind) {
-    sameBinning = histogramJson["binEdges"] ==
-                      referenceHistogram["binEdges"] &&
-                  histogramJson["binWidths"] ==
-                      referenceHistogram["binWidths"];
+    sameBinning = histogramJson["binEdges"] == referenceHistogram["binEdges"] &&
+                  histogramJson["binWidths"] == referenceHistogram["binWidths"];
   }
   if (!sameBinning) {
     return absl::InvalidArgumentError(
@@ -781,17 +779,15 @@ inline absl::Status MergeHistogramCounts(const bool isCentered,
  * when no partial carried one) and validates the totals against the statsV1
  * field types.
  */
-inline mdio::Result<SummaryStats> AssembleMergedStats(
-    MergeStatsState& state) {
+inline mdio::Result<SummaryStats> AssembleMergedStats(MergeStatsState& state) {
   if (state.count > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
     return absl::InvalidArgumentError(
         "MergeStats: total count " + std::to_string(state.count) +
         " exceeds the int32 statsV1 count field.");
   }
-  MDIO_ASSIGN_OR_RETURN(
-      const CheckedStatsScalars scalars,
-      CheckStatsScalars(state.sum, state.sumSquares, state.minValue,
-                        state.maxValue));
+  MDIO_ASSIGN_OR_RETURN(const CheckedStatsScalars scalars,
+                        CheckStatsScalars(state.sum, state.sumSquares,
+                                          state.minValue, state.maxValue));
 
   std::unique_ptr<const Histogram> histogram;
   if (state.haveHistogram) {
@@ -801,8 +797,8 @@ inline mdio::Result<SummaryStats> AssembleMergedStats(
     if (state.referenceHistogram.contains("binCenters")) {
       const std::vector<float> binCenters =
           state.referenceHistogram["binCenters"].get<std::vector<float>>();
-      histogram = std::make_unique<CenteredBinHistogram<float>>(binCenters,
-                                                                counts);
+      histogram =
+          std::make_unique<CenteredBinHistogram<float>>(binCenters, counts);
     } else {
       const std::vector<float> binEdges =
           state.referenceHistogram["binEdges"].get<std::vector<float>>();
@@ -1160,77 +1156,6 @@ class UserAttributes {
   const nlohmann::json attrs;
 };
 
-// Variable is defined in variable.h, which includes this header; it can only
-// be forward declared here, so the ComputeStats declarations spell out the
-// dtype-erased Variable<void, dynamic_rank, ReadWriteMode::dynamic> instead
-// of using its default template arguments.
-template <typename T, DimensionIndex R, ReadWriteMode M>
-struct Variable;
-
-/**
- * @brief Computes the statsV1 summary statistics of a variable.
- *
- * Reads the whole variable and produces the on-disk statsV1 contract: an
- * int32 count, float32 sum/sumSquares/min/max, and a CenteredBinHistogram
- * with `internal::kDefaultHistogramBinCount` bins derived from the data
- * range. NaN values are skipped (they are "missing", not values); a variable
- * with no data yields the canonical empty statsV1 (count 0, zeroed fields,
- * empty histogram), matching the mdio-python convention.
- *
- * Supported dtypes are float32, float64, and the signed/unsigned integer
- * types; anything else (e.g. float16, complex, struct arrays) is rejected.
- *
- * \b Publishing: the result is not persisted by this call. The flow is
- * ComputeStats, merge the statsV1 JSON into the variable's current
- * attributes, update, then commit for durability:
- * @code
- * MDIO_ASSIGN_OR_RETURN(auto stats, mdio::ComputeStats(variable));
- * nlohmann::json attrs = variable.GetAttributes();
- * attrs["statsV1"] = stats.getBindable();
- * MDIO_RETURN_IF_ERROR(variable.UpdateAttributes(attrs));
- * MDIO_RETURN_IF_ERROR(dataset.CommitMetadata().status());
- * @endcode
- * `UpdateAttributes` replaces the whole UserAttributes, so start from
- * `GetAttributes()` to preserve any existing attributes/units. Caveat
- * (measured downstream, api-gap-plan M4 acceptance): for some store
- * layouts this round-trip nests the attributes key one level deeper per
- * commit; for such layouts use the narrow form
- * `UpdateAttributes({{"statsV1", stats.getBindable()}})` — it still
- * replaces the whole UserAttributes, so include `unitsV1`/`attributes`
- * alongside when they must survive.
- *
- * @param var The variable to compute statistics over.
- * @return The summary statistics, or an error for an unsupported dtype or a
- * value that the float32 statsV1 fields cannot represent.
- */
-Result<SummaryStats> ComputeStats(
-    const Variable<void, dynamic_rank, ReadWriteMode::dynamic>& var);
-
-/**
- * @brief Computes the statsV1 summary statistics of a variable with explicit
- * histogram bin centers.
- *
- * Identical to the single-argument overload, except the histogram uses the
- * supplied bin centers instead of deriving them from the data range. Values
- * are assigned to the nearest bin center; a value exactly between two
- * centers goes to the higher one, and values outside the center range are
- * clamped to the first/last bin.
- *
- * This is the overload distributed callers should use: partials computed
- * with the same explicit bin centers can be combined with MergeStats, while
- * partials that each derive bins from their own sub-range cannot (their bin
- * centers will not agree).
- *
- * @param var The variable to compute statistics over.
- * @param binCenters The bin centers of the histogram. Must be non-empty and
- * strictly increasing.
- * @return The summary statistics, or an error for invalid bin centers, an
- * unsupported dtype, or an unrepresentable value.
- */
-Result<SummaryStats> ComputeStats(
-    const Variable<void, dynamic_rank, ReadWriteMode::dynamic>& var,
-    absl::Span<const float> binCenters);
-
 /**
  * @brief Order-independent combination of partial statsV1 results.
  *
@@ -1289,8 +1214,8 @@ inline Result<SummaryStats> MergeStats(
       continue;
     }
 
-    MDIO_RETURN_IF_ERROR(internal::MergeHistogramCounts(
-        classified.isCentered, histogramJson, state));
+    MDIO_RETURN_IF_ERROR(internal::MergeHistogramCounts(classified.isCentered,
+                                                        histogramJson, state));
   }
 
   if (!state.haveData) {

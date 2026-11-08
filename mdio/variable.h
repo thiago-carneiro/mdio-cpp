@@ -15,6 +15,7 @@
 #ifndef MDIO_VARIABLE_H_
 #define MDIO_VARIABLE_H_
 
+#include <cmath>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1342,8 +1343,9 @@ class Variable : public VariableBase {
       // Report the clamped descriptor: it is what failed the check above.
       return Result<Variable>{absl::InvalidArgumentError(
           std::string("Slice descriptor for ") +
-          std::string(bad_d.label.label()) + " is invalid: start=" +
-          std::to_string(bad_d.start) + " > stop=" + std::to_string(bad_d.stop))};
+          std::string(bad_d.label.label()) +
+          " is invalid: start=" + std::to_string(bad_d.start) +
+          " > stop=" + std::to_string(bad_d.stop))};
     }
 
     // 3) Fast path: all labels (or axis indices) are unique
@@ -2240,8 +2242,7 @@ inline absl::Status AccumulateStatsDispatch(
                                           scalars, binCounts);
   } else {
     return absl::InvalidArgumentError(
-        "ComputeStats does not support dtype '" +
-        std::string(dtype.name()) +
+        "ComputeStats does not support dtype '" + std::string(dtype.name()) +
         "'. Supported dtypes are float32, float64, and the signed/unsigned "
         "integer types.");
   }
@@ -2289,14 +2290,13 @@ inline Result<std::vector<float>> DeriveDefaultBins(
   if (scalars.min == scalars.max) {
     centers.push_back(minValue);
   } else {
-    centers = UniformBinCenters(scalars.min, scalars.max,
-                                kDefaultHistogramBinCount);
+    centers =
+        UniformBinCenters(scalars.min, scalars.max, kDefaultHistogramBinCount);
   }
   const std::vector<double> upperEdges = BinUpperEdges(centers);
   binCounts->assign(centers.size(), 0);
-  MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(data, numElements, dtype,
-                                               &upperEdges, nullptr,
-                                               binCounts));
+  MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
+      data, numElements, dtype, &upperEdges, nullptr, binCounts));
   return Result<std::vector<float>>(centers);
 }
 
@@ -2343,24 +2343,22 @@ inline Result<SummaryStats> ComputeStatsImpl(
         "ComputeStats: count " + std::to_string(scalars.count) +
         " exceeds the int32 statsV1 count field.");
   }
-  MDIO_ASSIGN_OR_RETURN(
-      const CheckedStatsScalars scalarsF,
-      CheckStatsScalars(scalars.sum, scalars.sumSquares, scalars.min,
-                        scalars.max));
+  MDIO_ASSIGN_OR_RETURN(const CheckedStatsScalars scalarsF,
+                        CheckStatsScalars(scalars.sum, scalars.sumSquares,
+                                          scalars.min, scalars.max));
 
   std::vector<float> centers(binCenters.begin(), binCenters.end());
   if (centers.empty()) {
-    MDIO_ASSIGN_OR_RETURN(
-        const std::vector<float> derivedBins,
-        DeriveDefaultBins(data, numElements, var.dtype(), scalars,
-                          scalarsF.min, &binCounts));
+    MDIO_ASSIGN_OR_RETURN(const std::vector<float> derivedBins,
+                          DeriveDefaultBins(data, numElements, var.dtype(),
+                                            scalars, scalarsF.min, &binCounts));
     centers = derivedBins;
   }
 
   // Per-bin counts cannot overflow int32: each is at most the total count.
   const std::vector<int32_t> counts(binCounts.begin(), binCounts.end());
-  auto histogram = std::make_unique<CenteredBinHistogram<float>>(centers,
-                                                                 counts);
+  auto histogram =
+      std::make_unique<CenteredBinHistogram<float>>(centers, counts);
   return SummaryStats::Create(static_cast<int32_t>(scalars.count), scalarsF.max,
                               scalarsF.min, scalarsF.sum, scalarsF.sumSquares,
                               std::move(histogram));
@@ -2368,12 +2366,69 @@ inline Result<SummaryStats> ComputeStatsImpl(
 
 }  // namespace internal
 
+/**
+ * @brief Computes the statsV1 summary statistics of a variable.
+ *
+ * Reads the whole variable and produces the on-disk statsV1 contract: an
+ * int32 count, float32 sum/sumSquares/min/max, and a CenteredBinHistogram
+ * with `internal::kDefaultHistogramBinCount` bins derived from the data
+ * range. NaN values are skipped (they are "missing", not values); a variable
+ * with no data yields the canonical empty statsV1 (count 0, zeroed fields,
+ * empty histogram), matching the mdio-python convention.
+ *
+ * Supported dtypes are float32, float64, and the signed/unsigned integer
+ * types; anything else (e.g. float16, complex, struct arrays) is rejected.
+ *
+ * \b Publishing: the result is not persisted by this call. The flow is
+ * ComputeStats, merge the statsV1 JSON into the variable's current
+ * attributes, update, then commit for durability:
+ * @code
+ * MDIO_ASSIGN_OR_RETURN(auto stats, mdio::ComputeStats(variable));
+ * nlohmann::json attrs = variable.GetAttributes();
+ * attrs["statsV1"] = stats.getBindable();
+ * MDIO_RETURN_IF_ERROR(variable.UpdateAttributes(attrs));
+ * MDIO_RETURN_IF_ERROR(dataset.CommitMetadata().status());
+ * @endcode
+ * `UpdateAttributes` replaces the whole UserAttributes, so start from
+ * `GetAttributes()` to preserve any existing attributes/units. Caveat
+ * (measured downstream, api-gap-plan M4 acceptance): for some store
+ * layouts this round-trip nests the attributes key one level deeper per
+ * commit; for such layouts use the narrow form
+ * `UpdateAttributes({{"statsV1", stats.getBindable()}})` — it still
+ * replaces the whole UserAttributes, so include `unitsV1`/`attributes`
+ * alongside when they must survive.
+ *
+ * @param var The variable to compute statistics over.
+ * @return The summary statistics, or an error for an unsupported dtype or a
+ * value that the float32 statsV1 fields cannot represent.
+ */
 inline Result<SummaryStats> ComputeStats(const Variable<>& var) {
   return internal::ComputeStatsImpl(var, {});
 }
 
-inline Result<SummaryStats> ComputeStats(
-    const Variable<>& var, absl::Span<const float> binCenters) {
+/**
+ * @brief Computes the statsV1 summary statistics of a variable with explicit
+ * histogram bin centers.
+ *
+ * Identical to the single-argument overload, except the histogram uses the
+ * supplied bin centers instead of deriving them from the data range. Values
+ * are assigned to the nearest bin center; a value exactly between two
+ * centers goes to the higher one, and values outside the center range are
+ * clamped to the first/last bin.
+ *
+ * This is the overload distributed callers should use: partials computed
+ * with the same explicit bin centers can be combined with MergeStats, while
+ * partials that each derive bins from their own sub-range cannot (their bin
+ * centers will not agree).
+ *
+ * @param var The variable to compute statistics over.
+ * @param binCenters The bin centers of the histogram. Must be non-empty and
+ * strictly increasing.
+ * @return The summary statistics, or an error for invalid bin centers, an
+ * unsupported dtype, or an unrepresentable value.
+ */
+inline Result<SummaryStats> ComputeStats(const Variable<>& var,
+                                         absl::Span<const float> binCenters) {
   return internal::ComputeStatsImpl(var, binCenters);
 }
 };  // namespace mdio
