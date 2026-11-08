@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "mdio/dataset_factory.h"
 #include "mdio/header_variable.h"
@@ -1159,6 +1160,8 @@ class Dataset {
    * - descending stop: last value >= bound
    * A bound with no contained value (entirely outside the axis) is an
    * error rather than a clamp.
+   * @param label The label of the coordinate axis being selected (used in
+   * error messages).
    * @param order The axis order; must not be kUnordered.
    * @param is_start True for the start endpoint, false for the stop.
    * @param coords The monotonic coordinate values in index order.
@@ -1167,8 +1170,9 @@ class Dataset {
    */
   template <typename ValueType>
   static Result<Index> nearest_contained_index(
-      const CoordinateOrder order, const bool is_start,
-      const std::vector<ValueType>& coords, const ValueType bound) {
+      const std::string_view label, const CoordinateOrder order,
+      const bool is_start, const std::vector<ValueType>& coords,
+      const ValueType bound) {
     if (is_start) {
       const auto it =
           order == CoordinateOrder::kAscending
@@ -1176,7 +1180,9 @@ class Dataset {
               : std::lower_bound(coords.begin(), coords.end(), bound,
                                  std::greater<ValueType>());
       if (it == coords.end()) {
-        return absl::InvalidArgumentError("Start value not found.");
+        return absl::InvalidArgumentError(
+            absl::StrCat("Start value ", bound,
+                         " not found on coordinate axis '", label, "'."));
       }
       return static_cast<Index>(it - coords.begin());
     }
@@ -1185,7 +1191,9 @@ class Dataset {
                         : std::upper_bound(coords.begin(), coords.end(), bound,
                                            std::greater<ValueType>());
     if (it == coords.begin()) {
-      return absl::InvalidArgumentError("Stop value not found.");
+      return absl::InvalidArgumentError(
+          absl::StrCat("Stop value ", bound, " not found on coordinate axis '",
+                       label, "'."));
     }
     return static_cast<Index>(it - coords.begin() - 1);
   }
@@ -1197,13 +1205,15 @@ class Dataset {
    * endpoints must match a coordinate exactly, and each endpoint value
    * must be unique on the axis. A start endpoint resolving after the
    * stop endpoint is not supported.
+   * @param label The label of the coordinate axis being selected (used in
+   * error messages).
    * @param coords The coordinate values in index order.
    * @param descriptor The value-typed range descriptor.
    * @param out_endpoints Receives the {start, stop} indices into coords.
    */
   template <typename ValueType>
   static absl::Status resolve_exact_endpoints(
-      const std::vector<ValueType>& coords,
+      const std::string_view label, const std::vector<ValueType>& coords,
       const RangeDescriptor<ValueType>& descriptor,
       std::pair<Index, Index>& out_endpoints) {
     std::pair<bool, Index> start = {false, 0};
@@ -1211,27 +1221,36 @@ class Dataset {
     for (size_t i = 0; i < coords.size(); ++i) {
       if (coords[i] == descriptor.start) {
         if (start.first) {
-          return absl::InvalidArgumentError("Repeated start value.");
+          return absl::InvalidArgumentError(
+              absl::StrCat("Repeated start value ", descriptor.start,
+                           " on coordinate axis '", label, "'."));
         }
         start = {true, static_cast<Index>(i)};
       }
       if (coords[i] == descriptor.stop) {
         if (stop.first) {
-          return absl::InvalidArgumentError("Repeated stop value.");
+          return absl::InvalidArgumentError(
+              absl::StrCat("Repeated stop value ", descriptor.stop,
+                           " on coordinate axis '", label, "'."));
         }
         stop = {true, static_cast<Index>(i)};
       }
     }
     if (!start.first) {
-      return absl::InvalidArgumentError("Start value not found.");
+      return absl::InvalidArgumentError(
+          absl::StrCat("Start value ", descriptor.start,
+                       " not found on coordinate axis '", label, "'."));
     }
     if (!stop.first) {
-      return absl::InvalidArgumentError("Stop value not found.");
+      return absl::InvalidArgumentError(
+          absl::StrCat("Stop value ", descriptor.stop,
+                       " not found on coordinate axis '", label, "'."));
     }
     if (start.second > stop.second) {
-      return absl::UnimplementedError(
-          "Start value happens after stop value. This is not a supported "
-          "case.");
+      return absl::UnimplementedError(absl::StrCat(
+          "Coordinate axis '", label,
+          "': Start value happens after stop value (", descriptor.start,
+          " after ", descriptor.stop, "). This is not a supported case."));
     }
     out_endpoints = {start.second, stop.second};
     return absl::OkStatus();
@@ -1261,10 +1280,9 @@ class Dataset {
     // resolve bounds onto the NaN position, silently mis-anchoring the
     // selection. A NaN-containing axis is corrupt; error loudly instead.
     if constexpr (std::is_floating_point_v<ValueType>) {
-      if (std::any_of(coords.begin(), coords.end(),
-                      [](const ValueType value) {
-                        return std::isnan(value);
-                      })) {
+      if (std::any_of(coords.begin(), coords.end(), [](const ValueType value) {
+            return std::isnan(value);
+          })) {
         return absl::InvalidArgumentError(
             "Coordinate axis '" + std::string(label) +
             "' contains NaN; range selection is not supported.");
@@ -1272,18 +1290,19 @@ class Dataset {
     }
     const CoordinateOrder order = classify_coordinate_order(coords);
     if (order == CoordinateOrder::kUnordered) {
-      return resolve_exact_endpoints(coords, descriptor, out_endpoints);
+      return resolve_exact_endpoints(label, coords, descriptor, out_endpoints);
     }
     MDIO_ASSIGN_OR_RETURN(
         const Index startIndex,
-        nearest_contained_index(order, true, coords, descriptor.start));
+        nearest_contained_index(label, order, true, coords, descriptor.start));
     MDIO_ASSIGN_OR_RETURN(
         const Index stopIndex,
-        nearest_contained_index(order, false, coords, descriptor.stop));
+        nearest_contained_index(label, order, false, coords, descriptor.stop));
     if (startIndex > stopIndex) {
-      return absl::UnimplementedError(
-          "Start value happens after stop value. This is not a supported "
-          "case.");
+      return absl::UnimplementedError(absl::StrCat(
+          "Coordinate axis '", label,
+          "': Start value happens after stop value (", descriptor.start,
+          " after ", descriptor.stop, "). This is not a supported case."));
     }
     out_endpoints = {startIndex, stopIndex};
     return absl::OkStatus();
@@ -1330,8 +1349,10 @@ class Dataset {
                          RangeDescriptor<typename Descriptors::type>> &&
                      ...)) {
         if (descriptor.start == descriptor.stop) {
-          trueStatus = absl::InvalidArgumentError(
-              "Start and stop values must be different.");
+          trueStatus = absl::InvalidArgumentError(absl::StrCat(
+              "Coordinate axis '", descriptor.label.label(),
+              "': Start and stop values must be different (both are ",
+              descriptor.start, ")."));
           return trueStatus;
         }
 
