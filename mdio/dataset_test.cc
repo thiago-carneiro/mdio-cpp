@@ -46,6 +46,18 @@
 // clang-format on
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide on fixed store names.
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 // Initialize Abseil logging before tests run: before InitializeLog() is
 // called, log messages are directed only to stderr and registered LogSinks
 // capture nothing (same pattern as gcs_test.cc).
@@ -65,8 +77,9 @@ std::string ZarrVersionToString(mdio::zarr::ZarrVersion version) {
  * @brief Returns the base path for test data based on Zarr version.
  */
 std::string GetBasePath(mdio::zarr::ZarrVersion version) {
-  return version == mdio::zarr::ZarrVersion::kV3 ? "zarrs/dataset_test_v3"
-                                                 : "zarrs/dataset_test";
+  return TestStorePath(version == mdio::zarr::ZarrVersion::kV3
+                           ? "zarrs/dataset_test_v3"
+                           : "zarrs/dataset_test");
 }
 
 /**
@@ -228,14 +241,14 @@ std::string GetBasePath(mdio::zarr::ZarrVersion version) {
 
 std::vector<::nlohmann::json> make_vars() {
   auto jvar1 = base_variable;
-  jvar1["kvstore"]["path"] = "dataset/var1";
+  jvar1["kvstore"]["path"] = TestStorePath("dataset/var1");
   jvar1["attributes"]["long_name"] = "variable_1";
   jvar1["metadata"]["shape"] = {100, 200, 300};
   jvar1["attributes"]["dimension_names"] = {"inline", "crossline", "sample"};
   jvar1["attributes"]["coordinates"] = {"var2"};
 
   auto jvar2 = base_variable;
-  jvar2["kvstore"]["path"] = "dataset/var2";
+  jvar2["kvstore"]["path"] = TestStorePath("dataset/var2");
   jvar2["attributes"]["long_name"] = "variable_2";
   jvar2["metadata"]["shape"] = {100, 200};
   jvar2["metadata"]["chunks"] = {20, 20};
@@ -656,7 +669,7 @@ TEST(DatasetSpec, valid) {
 TEST(Dataset, isel) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean)
                      .result();
 
@@ -696,7 +709,7 @@ TEST(Dataset, isel) {
 
 TEST(Dataset, iselWithStride) {
   // Tests the integrity of data that is written with a strided slice.
-  std::string iselPath = "zarrs/acceptance";
+  std::string iselPath = TestStorePath("zarrs/acceptance");
   {  // Scoping the dataset creation to ensure the variables are cleaned up
      // before the testing.
     auto json_vars = GetToyExample();
@@ -822,7 +835,7 @@ TEST(Dataset, iselWithStride) {
 }
 
 TEST(Dataset, iselWithStrideAndExistingData) {
-  std::string testPath = "zarrs/slice_scale_test";
+  std::string testPath = TestStorePath("zarrs/slice_scale_test");
   float scaleFactor = 2.5f;
 
   // --- Step 1: Initialize the entire image variable with QC values and Write
@@ -937,7 +950,7 @@ TEST(Dataset, iselWithStrideAndExistingData) {
 }
 
 TEST(Dataset, selValue) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -972,7 +985,7 @@ TEST(Dataset, selValue) {
 }
 
 TEST(Dataset, selIndex) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -985,7 +998,7 @@ TEST(Dataset, selIndex) {
 }
 
 TEST(Dataset, selRepeatedValue) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1020,7 +1033,7 @@ TEST(Dataset, selRepeatedValue) {
 }
 
 TEST(Dataset, selMultipleValues) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1056,7 +1069,7 @@ TEST(Dataset, selMultipleValues) {
 }
 
 TEST(Dataset, selRepeated) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1071,7 +1084,7 @@ TEST(Dataset, selRepeated) {
 }
 
 TEST(Dataset, selList) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1084,7 +1097,7 @@ TEST(Dataset, selList) {
 }
 
 TEST(Dataset, selListMissingCoord) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1097,7 +1110,7 @@ TEST(Dataset, selListMissingCoord) {
 }
 
 TEST(Dataset, selRange) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1109,7 +1122,7 @@ TEST(Dataset, selRange) {
 }
 
 TEST(Dataset, legacySliceDescriptor) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1122,7 +1135,7 @@ TEST(Dataset, legacySliceDescriptor) {
 }
 
 TEST(Dataset, selRangeFlippedStartStop) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1138,7 +1151,7 @@ TEST(Dataset, selRangeFlippedStartStop) {
 }
 
 TEST(Dataset, selRepeatedListSingleton) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1150,7 +1163,7 @@ TEST(Dataset, selRepeatedListSingleton) {
 }
 
 TEST(Dataset, selRepeatedListMulti) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1162,7 +1175,7 @@ TEST(Dataset, selRepeatedListMulti) {
 }
 
 TEST(Dataset, selRepeatedRangeStart) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1174,7 +1187,7 @@ TEST(Dataset, selRepeatedRangeStart) {
 }
 
 TEST(Dataset, selRepeatedRangeStop) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1189,7 +1202,7 @@ TEST(Dataset, selRepeatedRangeStop) {
 // coordinate value (xarray/pandas label-slicing semantics), verified
 // against mdio-python on the same store.
 TEST(Dataset, selRangeNearestValueAscending) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1217,7 +1230,7 @@ TEST(Dataset, selRangeNearestValueAscending) {
 // Endpoints partially outside a monotonic axis clamp to the contained
 // edge rather than erroring.
 TEST(Dataset, selRangeNearestValueAscendingClampsToEnds) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1245,7 +1258,7 @@ TEST(Dataset, selRangeNearestValueAscendingClampsToEnds) {
 // first value <= bound, stop the last value >= bound (mdio-python
 // behavior, verified empirically).
 TEST(Dataset, selRangeNearestValueDescending) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1272,7 +1285,7 @@ TEST(Dataset, selRangeNearestValueDescending) {
 // Endpoints partially outside a descending axis clamp to the contained
 // edge (mdio-python behavior, verified empirically).
 TEST(Dataset, selRangeNearestValueDescendingClampsToEnds) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1299,7 +1312,7 @@ TEST(Dataset, selRangeNearestValueDescendingClampsToEnds) {
 // Endpoints entirely outside the axis are an error, not a clamp to the
 // nearest edge and not an empty selection.
 TEST(Dataset, selRangeEntirelyOutsideRange) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1330,7 +1343,7 @@ TEST(Dataset, selRangeEntirelyOutsideRange) {
 // A start endpoint that resolves after the stop endpoint (flipped
 // selection) is not supported, on descending axes as on ascending ones.
 TEST(Dataset, selRangeDescendingFlippedStartStop) {
-  std::string path = "zarrs/monotonicSelTester.mdio";
+  std::string path = TestStorePath("zarrs/monotonicSelTester.mdio");
   auto dsRes = makeMonotonicPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1349,7 +1362,7 @@ TEST(Dataset, selRangeDescendingFlippedStartStop) {
 // NaN position, so without the guard the range [3, 3.5] silently selects
 // at the NaN index instead of erroring.
 TEST(Dataset, selRangeNaNAxisErrors) {
-  std::string path = "zarrs/nanSelTester.mdio";
+  std::string path = TestStorePath("zarrs/nanSelTester.mdio");
   auto dsRes = makeNaNAxisPopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1397,7 +1410,7 @@ TEST(Dataset, selRangeNaNAxisErrors) {
 // exact, unique endpoints; the selection is positional between them.
 // mdio-python returns [2, 3, 4, 3, 5] for the same slice on this store.
 TEST(Dataset, selRangeUnorderedExactEndpoints) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -1415,7 +1428,7 @@ TEST(Dataset, selRangeUnorderedExactEndpoints) {
 TEST(Dataset, selectField) {
   auto json_var = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_var, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
@@ -1465,7 +1478,7 @@ TEST(Dataset, selectField) {
 TEST(Dataset, selectFieldName) {
   auto json_var = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_var, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
@@ -1481,13 +1494,13 @@ TEST(Dataset, selectFieldName) {
 TEST(Dataset, fromConsolidatedMeta) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean)
                      .result();
 
   ASSERT_TRUE(dataset.ok());
 
-  std::string dataset_path = "zarrs/acceptance/";
+  std::string dataset_path = TestStorePath("zarrs/acceptance/");
 
   auto new_dataset =
       mdio::Dataset::Open(dataset_path, mdio::constants::kOpen).result();
@@ -1497,7 +1510,7 @@ TEST(Dataset, fromConsolidatedMeta) {
 TEST(Dataset, open) {
   auto json_schema = GetToyExample();
 
-  auto validated_schema = Construct(json_schema, "zarrs/acceptance");
+  auto validated_schema = Construct(json_schema, TestStorePath("zarrs/acceptance"));
 
   ASSERT_TRUE(validated_schema.ok());
 
@@ -1522,7 +1535,7 @@ TEST(Dataset, openWithContext) {
 
   auto json_schema = GetToyExample();
 
-  auto validated_schema = Construct(json_schema, "zarrs/acceptance");
+  auto validated_schema = Construct(json_schema, TestStorePath("zarrs/acceptance"));
 
   ASSERT_TRUE(validated_schema.ok());
 
@@ -1538,7 +1551,7 @@ TEST(Dataset, openWithContext) {
 TEST(Dataset, fromJson) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean)
                      .result();
 
@@ -1590,14 +1603,14 @@ TEST(Dataset, multiFuture) {
 TEST(Dataset, coordinates) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   EXPECT_TRUE(dataset.value().coordinates.size() > 0)
       << "Dataset expected to have coordinates but none were present!";
 
-  std::string path = "zarrs/acceptance";
+  std::string path = TestStorePath("zarrs/acceptance");
   auto dataset_open = mdio::Dataset::Open(path, mdio::constants::kOpen);
   ASSERT_TRUE(dataset_open.status().ok()) << dataset_open.status();
   EXPECT_TRUE(dataset_open.value().coordinates.size() > 0)
@@ -1607,7 +1620,7 @@ TEST(Dataset, coordinates) {
 TEST(Dataset, noIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
@@ -1625,7 +1638,7 @@ TEST(Dataset, noIntervals) {
 TEST(Dataset, oneInterval) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
@@ -1640,7 +1653,7 @@ TEST(Dataset, oneInterval) {
 TEST(Dataset, mixedIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
@@ -1656,7 +1669,7 @@ TEST(Dataset, mixedIntervals) {
 TEST(Dataset, wrongIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
@@ -1669,7 +1682,7 @@ TEST(Dataset, wrongIntervals) {
 TEST(Dataset, slicedIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
@@ -1698,16 +1711,16 @@ TEST(Dataset, slicedIntervals) {
 }
 
 TEST(Dataset, create) {
-  std::filesystem::remove_all("zarrs/acceptance");
+  std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
 
   // Create with no pre-existing Dataset
   auto json_vars = GetToyExample();
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreate);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
 
   // Create with pre-existing Dataset
-  dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                      mdio::constants::kCreateClean);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
 
@@ -1716,15 +1729,15 @@ TEST(Dataset, create) {
   json_vars["variables"][0]["metadata"]["statsV1"]["count"] = 222;
   json_vars["metadata"]["foo"] = "nobar";
   auto dataset_overwrite = mdio::Dataset::from_json(
-      json_vars, "zarrs/acceptance", mdio::constants::kCreate);
+      json_vars, TestStorePath("zarrs/acceptance"), mdio::constants::kCreate);
 
   EXPECT_FALSE(dataset_overwrite.status().ok())
       << "Dataset successfully overwrote an existing dataset!";
 }
 
 TEST(Dataset, getVariableUnits) {
-  const std::string path = "zarrs/acceptance";
-  std::filesystem::remove_all("zarrs/acceptance");
+  const std::string path = TestStorePath("zarrs/acceptance");
+  std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
   auto datasetRes =
@@ -1743,8 +1756,8 @@ TEST(Dataset, getVariableUnits) {
 }
 
 TEST(Dataset, getVariableUnitsError) {
-  const std::string path = "zarrs/acceptance";
-  std::filesystem::remove_all("zarrs/acceptance");
+  const std::string path = TestStorePath("zarrs/acceptance");
+  std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
   auto datasetRes =
@@ -1763,11 +1776,11 @@ TEST(Dataset, getVariableUnitsError) {
 }
 
 TEST(Dataset, commitMetadata) {
-  const std::string path = "zarrs/acceptance";
-  std::filesystem::remove_all("zarrs/acceptance");
+  const std::string path = TestStorePath("zarrs/acceptance");
+  std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
@@ -1813,10 +1826,10 @@ TEST(Dataset, commitMetadata) {
 }
 
 TEST(Dataset, commitSlicedMetadata) {
-  std::filesystem::remove_all("zarrs/acceptance");
+  std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
@@ -1850,7 +1863,7 @@ TEST(Dataset, openNonExistent) {
   auto json_vars = GetToyExample();
 
   auto datasetRes =
-      mdio::Dataset::from_json(json_vars, "zarrs/DNE", mdio::constants::kOpen);
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/DNE"), mdio::constants::kOpen);
   ASSERT_FALSE(datasetRes.status().ok())
       << "Opened a non-existent dataset without error!";
 }
@@ -1859,7 +1872,7 @@ TEST(Dataset, openNonExistent) {
 // must report the missing store itself, not a .zmetadata parse error from
 // the V2 fallback.
 TEST(Dataset, openNonExistentPathReportsMissingStore) {
-  std::string path = "zarrs/missing_store_test";
+  std::string path = TestStorePath("zarrs/missing_store_test");
   auto datasetRes = mdio::Dataset::Open(path, mdio::constants::kOpen);
   ASSERT_FALSE(datasetRes.status().ok())
       << "Opened a non-existent dataset without error!";
@@ -1910,7 +1923,7 @@ class CapturingLogSink : public absl::LogSink {
 // metadata. Opening such a store must succeed (lenient read path) and warn
 // about the missing informational fields.
 TEST(Dataset, openV3WithoutDatasetMetadata) {
-  std::string path = "zarrs/py_written_v3";
+  std::string path = TestStorePath("zarrs/py_written_v3");
   std::filesystem::remove_all(path);
 
   auto json_vars = GetToyExample();
@@ -1941,7 +1954,7 @@ TEST(Dataset, openV3WithoutDatasetMetadata) {
 // A store written by mdio-cpp carries the full dataset metadata; opening it
 // must keep succeeding without the missing-metadata warning.
 TEST(Dataset, openV3WithDatasetMetadata) {
-  std::string path = "zarrs/cpp_written_v3";
+  std::string path = TestStorePath("zarrs/cpp_written_v3");
   std::filesystem::remove_all(path);
 
   auto json_vars = GetToyExample();
@@ -1971,7 +1984,7 @@ TEST(Dataset, createSpecWithoutDatasetMetadataIsRejected) {
   json_vars["metadata"].erase("createdOn");
 
   auto created = mdio::Dataset::from_json(
-      json_vars, "zarrs/creation_no_metadata", mdio::zarr::ZarrVersion::kV3,
+      json_vars, TestStorePath("zarrs/creation_no_metadata"), mdio::zarr::ZarrVersion::kV3,
       mdio::constants::kCreateClean);
   ASSERT_FALSE(created.status().ok())
       << "creation spec without dataset metadata must be rejected";
@@ -1982,11 +1995,11 @@ TEST(Dataset, createSpecWithoutDatasetMetadataIsRejected) {
 TEST(Dataset, kCreateOverExisting) {
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                              mdio::constants::kCreateClean);
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
 
-  datasetRes = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                         mdio::constants::kCreate);
   ASSERT_FALSE(datasetRes.status().ok())
       << "Created a dataset over an existing "
@@ -1995,7 +2008,7 @@ TEST(Dataset, kCreateOverExisting) {
 
 TEST(Dataset, mockV0) {
   // TODO(BriaMich): Update this test to do a full mock of the v0 dataset schema
-  std::string path = "zarrs/acceptance";
+  std::string path = TestStorePath("zarrs/acceptance");
 
   // Build a v1 Dataset on disk
   auto json_vars = GetToyExample();
@@ -2216,23 +2229,23 @@ INSTANTIATE_TEST_SUITE_P(
 
 // Test nullopt version (should default to V2)
 TEST(DatasetVersionNullopt, fromJsonWithNulloptVersion) {
-  std::filesystem::remove_all("zarrs/nullopt_version");
+  std::filesystem::remove_all(TestStorePath("zarrs/nullopt_version"));
   auto json_vars = GetToyExample();
 
   std::optional<mdio::zarr::ZarrVersion> version = std::nullopt;
   auto dataset =
-      mdio::Dataset::from_json(json_vars, "zarrs/nullopt_version", version,
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/nullopt_version"), version,
                                mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   EXPECT_EQ(dataset.value().getMetadata()["name"], "campos_3d");
 
-  std::filesystem::remove_all("zarrs/nullopt_version");
+  std::filesystem::remove_all(TestStorePath("zarrs/nullopt_version"));
 }
 
 TEST(Dataset, iselWithEmptySlicesVector) {
   auto json_vars = GetToyExample();
-  auto dataset = mdio::Dataset::from_json(json_vars, "zarrs/acceptance",
+  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
                                           mdio::constants::kCreateClean);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   auto ds = dataset.value();
@@ -2245,7 +2258,7 @@ TEST(Dataset, iselWithEmptySlicesVector) {
 }
 
 TEST(Dataset, selWithDimensionIndex) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -2260,7 +2273,7 @@ TEST(Dataset, selWithDimensionIndex) {
 }
 
 TEST(Dataset, selWithRepeatedLabels) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -2276,7 +2289,7 @@ TEST(Dataset, selWithRepeatedLabels) {
 }
 
 TEST(Dataset, commitMetadataNoChanges) {
-  const std::string path = "zarrs/acceptance_no_commit";
+  const std::string path = TestStorePath("zarrs/acceptance_no_commit");
   std::filesystem::remove_all(path);
   auto json_vars = GetToyExample();
 
@@ -2294,7 +2307,7 @@ TEST(Dataset, commitMetadataNoChanges) {
 }
 
 TEST(Dataset, selRangeWithSameStartStop) {
-  std::string path = "zarrs/selTester.mdio";
+  std::string path = TestStorePath("zarrs/selTester.mdio");
   auto dsRes = makePopulated(path);
   ASSERT_TRUE(dsRes.ok()) << dsRes.status();
   auto ds = dsRes.value();
@@ -2449,7 +2462,7 @@ TEST(Dataset, toJsonRejectsHeaderVariablesLoudly) {
       {"name", "header_only"},
       {"apiVersion", "1.0.0"},
       {"createdOn", "2023-12-12T15:02:06.413469-06:00"}};
-  const nlohmann::json header_spec = nlohmann::json::parse(R"({
+  nlohmann::json header_spec = nlohmann::json::parse(R"({
     "_mdio_header_only": true,
     "driver": "zarr3",
     "kvstore": {
@@ -2467,6 +2480,8 @@ TEST(Dataset, toJsonRejectsHeaderVariablesLoudly) {
       }
     }
   })");
+  header_spec["kvstore"]["path"] =
+      TestStorePath("zarrs/to_json_header_only/segy_file_header");
 
   auto dsRes =
       mdio::Dataset::Open(metadata, {header_spec}, mdio::constants::kOpen);

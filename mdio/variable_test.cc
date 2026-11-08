@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -40,6 +41,18 @@
 
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide on fixed store names.
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 /**
  * @brief Returns a string representation of the Zarr version for naming.
  */
@@ -48,7 +61,10 @@ std::string ZarrVersionToString(mdio::zarr::ZarrVersion version) {
 }
 
 /**
- * @brief Returns the base path for test data based on Zarr version.
+ * @brief Returns the bare per-version base name for test data.
+ *
+ * Callers move it under the per-test directory with TestStorePath; the name
+ * itself is also the variable name derived from the kvstore path basename.
  */
 std::string GetBasePath(mdio::zarr::ZarrVersion version) {
   return version == mdio::zarr::ZarrVersion::kV3 ? "variable_test_v3"
@@ -76,6 +92,8 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
   nlohmann::json spec;
   spec["driver"] = GetTestDriverName(version);
   spec["kvstore"]["driver"] = "file";
+  // `name` is expected to already be a per-test path (see
+  // VariableVersionTest::SetUp); raw names would land relative to the CWD.
   spec["kvstore"]["path"] = name;
 
   if (version == mdio::zarr::ZarrVersion::kV3) {
@@ -112,12 +130,13 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
 }  // namespace
 
 // clang-format off
-::nlohmann::json json_good = ::nlohmann::json::object({
+::nlohmann::json JsonGood() {
+  return ::nlohmann::json::object({
     {"driver", "zarr"},
     {"kvstore",
         {
             {"driver", "file"},
-            {"path", "name"}
+            {"path", TestStorePath("name")}
         }
     },
     {"attributes",
@@ -144,14 +163,15 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
         }
     }
 });
+}
 
-
-::nlohmann::json json_bad_1 = {
+::nlohmann::json JsonBad1() {
+  return {
     {"driver", "zarr"},
     {"kvstore",
         {
             {"driver", "file"},
-            {"path", "name"}
+            {"path", TestStorePath("name")}
         }
     },
     {"attributes",
@@ -176,14 +196,15 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
         }
     }
 };
+}
 
-
-::nlohmann::json json_bad_2 = {
+::nlohmann::json JsonBad2() {
+  return {
     {"driver", "zarr"},
     {"kvstore",
         {
             {"driver", "file"},
-            {"path", "name"}
+            {"path", TestStorePath("name")}
         }
     },
     {"metadata",
@@ -196,6 +217,7 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
         }
     }
 };
+}
 
 ::nlohmann::json GetJsonSpecStruct() {
     std::string new_spec = R"(
@@ -219,17 +241,20 @@ std::string GetTestDriverName(mdio::zarr::ZarrVersion version) {
             }
         }
     )";
-    // Parse the string to a JSON object
-    return nlohmann::json::parse(new_spec);
+    // Parse the string to a JSON object, then move the store under the
+    // per-test directory.
+    auto parsed = nlohmann::json::parse(new_spec);
+    parsed["kvstore"]["path"] = TestStorePath("test.zarr");
+    return parsed;
 }
 
 // clang-format on
 
 namespace {
-mdio::Result<::nlohmann::json> PopulateStore(const nlohmann::json& json_good) {
+mdio::Result<::nlohmann::json> PopulateStore(const nlohmann::json& spec) {
   MDIO_ASSIGN_OR_RETURN(
       auto result,
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean)
+      mdio::Variable<>::Open(spec, mdio::constants::kCreateClean)
           .result());
 
   MDIO_ASSIGN_OR_RETURN(auto variableDataFuture, result.Read().result());
@@ -247,7 +272,7 @@ mdio::Result<::nlohmann::json> PopulateStore(const nlohmann::json& json_good) {
   write_future.commit_future.Wait();
   write_future.copy_future.Wait();
 
-  auto output_json = json_good;
+  auto output_json = spec;
   output_json.erase("attributes");
   output_json.erase("metadata");
 
@@ -258,7 +283,7 @@ TEST(VariableData, conversion) {
   using int16_t = mdio::dtypes::int16_t;
 
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
   ASSERT_TRUE(variable.ok()) << variable.status();
 
   auto variable_a = mdio::from_variable<int16_t>(variable.value());
@@ -281,7 +306,7 @@ TEST(VariableData, fromVariable) {
   using int16_t = mdio::dtypes::int16_t;
 
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   ASSERT_TRUE(variable.ok());
 
@@ -308,7 +333,7 @@ TEST(VariableData, fromVariable2) {
   using int16_t = mdio::dtypes::int16_t;
 
   auto variable =
-      mdio::Variable<int16_t>::Open(json_good, mdio::constants::kCreateClean)
+      mdio::Variable<int16_t>::Open(JsonGood(), mdio::constants::kCreateClean)
           .result();
 
   ASSERT_TRUE(variable.ok());
@@ -340,7 +365,7 @@ TEST(Variable, context) {
   auto context = mdio::Context(spec.value());
 
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean, context)
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean, context)
           .result();
 }
 
@@ -363,7 +388,7 @@ TEST(Variable, structArray) {
   // check it should have the right dtype
   ASSERT_TRUE(variable->dtype() == bytes);
 
-  std::filesystem::remove_all("test.zarr");
+  std::filesystem::remove_all(TestStorePath("test.zarr"));
 }
 
 TEST(Variable, structArrayField) {
@@ -382,7 +407,7 @@ TEST(Variable, structArrayField) {
 
   ASSERT_TRUE(variableB.ok());
   ASSERT_TRUE(variableB.value().dtype() == mdio::constants::kInt32);
-  std::filesystem::remove_all("test.zarr");
+  std::filesystem::remove_all(TestStorePath("test.zarr"));
 }
 
 TEST(Variable, structArrayOpen) {
@@ -414,12 +439,12 @@ TEST(Variable, structArrayOpen) {
   // check it should have the right dtype
   ASSERT_TRUE(variable->dtype() == bytes);
 
-  std::filesystem::remove_all("test.zarr");
+  std::filesystem::remove_all(TestStorePath("test.zarr"));
 }
 
 TEST(Variable, open) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   // compile time example
   mdio::RangeDescriptor<mdio::Index> desc1 = {"x", 0, 5, 1};
@@ -436,20 +461,20 @@ TEST(Variable, open) {
 
   EXPECT_THAT(domain.shape(), ::testing::ElementsAre(5, 6));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, rank) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(variable.status().ok()) << variable.status();
   auto rank = variable.value().rank();
   EXPECT_EQ(rank, 2);
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, openMetadata) {
-  auto json = json_good["metadata"];
+  auto json = JsonGood()["metadata"];
 
   /*
   ZarrPartialMetadata partial_metadata;
@@ -528,9 +553,9 @@ TEST(Variable, openMetadata) {
 
 TEST(Variable, openExisting) {
   auto _variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
-  ::nlohmann::json open_json_spec = json_good;
+  ::nlohmann::json open_json_spec = JsonGood();
   // just supply the driver and kvstore:
   open_json_spec.erase("metadata");
   open_json_spec.erase("attributes");
@@ -546,7 +571,7 @@ TEST(Variable, openExisting) {
 
   EXPECT_THAT(domain.labels(), ::testing::ElementsAre("x", "y"));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, mismatchAttrs) {
@@ -565,7 +590,7 @@ TEST(Variable, mismatchAttrs) {
   auto variable3 = mdio::Variable<>::Open(json);
   ASSERT_FALSE(variable3.status().ok()) << variable3.status();
 
-  std::filesystem::remove_all("test.zarr");
+  std::filesystem::remove_all(TestStorePath("test.zarr"));
 }
 
 TEST(Variable, updateMetadata) {
@@ -615,7 +640,7 @@ TEST(Variable, publishNoAttrs) {
 
 TEST(Variable, slice) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   // compile time example
   mdio::RangeDescriptor<mdio::Index> desc1 = {"x", 0, 5, 1};
@@ -632,12 +657,12 @@ TEST(Variable, slice) {
 
   EXPECT_THAT(domain.shape(), ::testing::ElementsAre(5, 6));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, legacySliceDescriptor) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   // compile time example
   mdio::SliceDescriptor desc1 = {"x", 0, 5, 1};
@@ -654,12 +679,12 @@ TEST(Variable, legacySliceDescriptor) {
 
   EXPECT_THAT(domain.shape(), ::testing::ElementsAre(5, 6));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, sliceTyped) {
   auto variable = mdio::Variable<mdio::dtypes::int16_t>::Open(
-                      json_good, mdio::constants::kCreateClean)
+                      JsonGood(), mdio::constants::kCreateClean)
                       .value();
 
   // compile time example
@@ -677,12 +702,12 @@ TEST(Variable, sliceTyped) {
 
   EXPECT_THAT(domain.shape(), ::testing::ElementsAre(5, 6));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, sliceVector) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   // compile time example
   mdio::RangeDescriptor<mdio::Index> desc1 = {"x", 0, 5, 1};
@@ -700,24 +725,24 @@ TEST(Variable, sliceVector) {
 
   EXPECT_THAT(domain.shape(), ::testing::ElementsAre(5, 6));
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, sliceEmptyVector) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   std::vector<mdio::RangeDescriptor<mdio::Index>> descriptors;
 
   auto result = variable.slice(descriptors);
   ASSERT_FALSE(result.ok());
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, sliceOverfullVector) {
   auto variable =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).value();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).value();
 
   // compile time example
   mdio::RangeDescriptor<mdio::Index> desc1 = {"x", 0, 5, 1};
@@ -729,7 +754,7 @@ TEST(Variable, sliceOverfullVector) {
   auto result = variable.slice(descriptors);
   ASSERT_FALSE(result.ok());
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(Variable, labeledArray) {
@@ -812,7 +837,7 @@ TEST(Variable, userAttributes) {
 
 TEST(Variable, getUnitsPresent) {
   auto var1Res =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(var1Res.status().ok()) << var1Res.status();
   auto var1 = var1Res.value();
 
@@ -824,7 +849,7 @@ TEST(Variable, getUnitsPresent) {
 // proper bounds.
 TEST(Variable, outOfBoundsSlice) {
   auto var =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   ASSERT_TRUE(var.ok());
   EXPECT_THAT(var->dimensions().shape(), ::testing::ElementsAre(500, 500));
@@ -844,7 +869,7 @@ TEST(Variable, outOfBoundsSlice) {
       << badDomain.dimensions();
 
   auto var1 =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   mdio::RangeDescriptor<mdio::Index> illegal_start_stop = {"x", 500, 0, 1};
   auto illegal = var1.value().slice(illegal_start_stop);
@@ -860,9 +885,9 @@ TEST(Variable, outOfBoundsSlice) {
 // precondition is checked, so the error must report the clamped values that
 // actually failed the check, not the original descriptor values.
 TEST(Variable, sliceErrorReportsClampedDescriptor) {
-  auto json_spec = json_good;
+  auto json_spec = JsonGood();
   json_spec["metadata"]["shape"] = {383, 383};
-  json_spec["kvstore"]["path"] = "slice_error_clamped";
+  json_spec["kvstore"]["path"] = TestStorePath("slice_error_clamped");
 
   auto var =
       mdio::Variable<>::Open(json_spec, mdio::constants::kCreateClean).result();
@@ -880,7 +905,7 @@ TEST(Variable, sliceErrorReportsClampedDescriptor) {
 
 TEST(Variable, noIntervals) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(varRes.status().ok()) << varRes.status();
   auto var = varRes.value();
 
@@ -892,7 +917,7 @@ TEST(Variable, noIntervals) {
 
 TEST(Variable, oneInterval) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(varRes.status().ok()) << varRes.status();
   auto var = varRes.value();
 
@@ -904,7 +929,7 @@ TEST(Variable, oneInterval) {
 
 TEST(Variable, mixedIntervals) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(varRes.status().ok()) << varRes.status();
   auto var = varRes.value();
 
@@ -916,7 +941,7 @@ TEST(Variable, mixedIntervals) {
 
 TEST(Variable, wrongIntervals) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(varRes.status().ok()) << varRes.status();
   auto var = varRes.value();
 
@@ -926,7 +951,7 @@ TEST(Variable, wrongIntervals) {
 
 TEST(Variable, slicedIntervals) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(varRes.status().ok()) << varRes.status();
   auto var = varRes.value();
 
@@ -966,7 +991,7 @@ TEST(Variable, slicedIntervals) {
 
 TEST(VariableData, outOfBoundsSlice) {
   auto varRes =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   ASSERT_TRUE(varRes.ok());
   auto var = varRes.value();
@@ -990,7 +1015,7 @@ TEST(VariableData, outOfBoundsSlice) {
 TEST(VariableSpec, open) {
   // this is the whole thing
   auto creation =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   ASSERT_TRUE(creation.ok());
 
@@ -1017,7 +1042,7 @@ TEST(VariableSpec, open) {
             {"kvstore",
                 {
                     {"driver", "file"},
-                    {"path", "name"}
+                    {"path", TestStorePath("name")}
                 }
             }
         };
@@ -1033,14 +1058,14 @@ TEST(VariableSpec, open) {
   EXPECT_EQ(construction->get_long_name(), std::string("foooooo ....."));
 
   // cleanup:
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableSpec, createVariable) {
   mdio::TransactionalOpenOptions options;
   auto opt = options.Set(std::move(mdio::constants::kCreateClean));
 
-  auto json_schema = mdio::internal::ValidateAndProcessJson(json_good).value();
+  auto json_schema = mdio::internal::ValidateAndProcessJson(JsonGood()).value();
   auto [json_store, metadata] = json_schema;
 
   auto result =
@@ -1050,11 +1075,11 @@ TEST(VariableSpec, createVariable) {
   ASSERT_TRUE(result.ok());
 
   // cleanup:
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableSpec, openVariable) {
-  auto json_schema = mdio::internal::ValidateAndProcessJson(json_good).value();
+  auto json_schema = mdio::internal::ValidateAndProcessJson(JsonGood()).value();
   auto [json_store, metadata] = json_schema;
 
   auto create_result = mdio::internal::CreateVariable(
@@ -1064,7 +1089,7 @@ TEST(VariableSpec, openVariable) {
   ASSERT_TRUE(create_result.ok());
 
   ::nlohmann::json open_json = {
-      {"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", "name"}}}};
+      {"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", TestStorePath("name")}}}};
 
   auto open_result =
       mdio::internal::OpenVariable(open_json, mdio::constants::kOpen).result();
@@ -1077,14 +1102,14 @@ TEST(VariableSpec, openVariable) {
   EXPECT_EQ(open_result->get_variable_name(), "name");
 
   // cleanup:
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableSpec, sliceVariable) {
   mdio::TransactionalOpenOptions options;
   auto opt = options.Set(std::move(mdio::constants::kCreateClean));
 
-  auto json_schema = mdio::internal::ValidateAndProcessJson(json_good).value();
+  auto json_schema = mdio::internal::ValidateAndProcessJson(JsonGood()).value();
   auto [json_store, metadata] = json_schema;
 
   auto result =
@@ -1095,7 +1120,7 @@ TEST(VariableSpec, sliceVariable) {
 
   //
   ::nlohmann::json open_json = {
-      {"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", "name"}}}};
+      {"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", TestStorePath("name")}}}};
 
   mdio::TransactionalOpenOptions options2;
   opt = options2.Set(std::move(mdio::constants::kOpen));
@@ -1119,12 +1144,12 @@ TEST(VariableSpec, sliceVariable) {
   // EXPECT_EQ(result4.status().ok(), false);
 
   // cleanup:
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableData, testConstruction) {
   auto variableFuture =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
 
   auto variableObject = variableFuture.result();
 
@@ -1142,12 +1167,12 @@ TEST(VariableData, testConstruction) {
   ss << variableDataObject.value();
   EXPECT_FALSE(ss.fail());
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableData, rank) {
   auto variableFuture =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean);
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean);
   ASSERT_TRUE(variableFuture.status().ok()) << variableFuture.status();
   auto variableObject = variableFuture.value();
   auto variableDataFuture = variableObject.Read();
@@ -1155,12 +1180,12 @@ TEST(VariableData, rank) {
   auto variableDataObject = variableDataFuture.result();
   EXPECT_EQ(variableDataObject.value().rank(), 2);
 
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableData, writeChunkedData) {
   auto result =
-      mdio::Variable<>::Open(json_good, mdio::constants::kCreateClean).result();
+      mdio::Variable<>::Open(JsonGood(), mdio::constants::kCreateClean).result();
 
   ASSERT_TRUE(result.ok());
 
@@ -1181,11 +1206,11 @@ TEST(VariableData, writeChunkedData) {
                             .commit_future.result());
 
   // cleanup:
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableData, flattenedOffset) {
-  auto json = PopulateStore(json_good).value();
+  auto json = PopulateStore(JsonGood()).value();
   auto variableObject = mdio::Variable<>::Open(json).result();
   EXPECT_TRUE(variableObject.ok());
 
@@ -1204,7 +1229,7 @@ TEST(VariableData, flattenedOffset) {
 }
 
 TEST(VariableData, inMemoryEdits) {
-  auto json = PopulateStore(json_good).value();
+  auto json = PopulateStore(JsonGood()).value();
   auto variableObject = mdio::Variable<>::Open(json).result();
   EXPECT_TRUE(variableObject.ok());
 
@@ -1247,7 +1272,7 @@ TEST(VariableData, inMemoryEdits) {
 }
 
 TEST(VariableData, checkInMemoryEdits) {
-  auto json = PopulateStore(json_good).value();
+  auto json = PopulateStore(JsonGood()).value();
   auto variableObject = mdio::Variable<>::Open(json).result();
   EXPECT_TRUE(variableObject.ok());
 
@@ -1284,7 +1309,7 @@ TEST(VariableData, checkInMemoryEdits) {
 }
 
 TEST(VariableData, nonOriginSlice) {
-  auto json = PopulateStore(json_good).value();
+  auto json = PopulateStore(JsonGood()).value();
   auto variableObject = mdio::Variable<>::Open(json).result();
   EXPECT_TRUE(variableObject.ok());
 
@@ -1307,7 +1332,7 @@ TEST(VariableData, nonOriginSlice) {
 }
 
 TEST(VariableData, writeTest) {
-  auto json = PopulateStore(json_good).value();
+  auto json = PopulateStore(JsonGood()).value();
   auto variableObject = mdio::Variable<>::Open(json).result();
   EXPECT_TRUE(variableObject.ok());
 
@@ -1352,12 +1377,12 @@ TEST(VariableData, writeTest) {
   auto data22 = _variableDataObject2.value().get_data_accessor().data();
   EXPECT_EQ(data22[0], 10000);
 
-  std::filesystem::remove_all("test.zarr");
-  std::filesystem::remove_all("name");
+  std::filesystem::remove_all(TestStorePath("test.zarr"));
+  std::filesystem::remove_all(TestStorePath("name"));
 }
 
 TEST(VariableData, fromVariableFillTest) {
-  auto goodJson = json_good;
+  auto goodJson = JsonGood();
   // Issue #144 reports double with fill value of NaN filling with 0's
   goodJson["metadata"]["dtype"] = "<f8";
   // Copy dataset factory fill value pattern for double.
@@ -1499,6 +1524,44 @@ TEST(ChunkRange, rejectsInvalidGrids) {
   EXPECT_FALSE(rank_mismatch.ok());
 }
 
+TEST(ChunkRange, extremeShapesDoNotOverflowAndAreRejected) {
+  const mdio::Index kIndexMax = std::numeric_limits<mdio::Index>::max();
+
+  // A maximal single-chunk grid stays representable: the chunk-grid math
+  // must be overflow-free up to the guards (regression for the signed
+  // overflow the (shape + chunk - 1) numerator and the stop clamp risked).
+  auto largest_single_chunk =
+      mdio::ChunkRange::Create({0}, {kIndexMax}, {kIndexMax});
+  ASSERT_TRUE(largest_single_chunk.ok()) << largest_single_chunk.status();
+  EXPECT_EQ(largest_single_chunk->size(), 1);
+  EXPECT_THAT(largest_single_chunk->begin()->origin(),
+              ::testing::ElementsAre(0));
+  EXPECT_THAT(largest_single_chunk->begin()->shape(),
+              ::testing::ElementsAre(kIndexMax));
+
+  // Maximal shape with a divisor-sized chunk: 2^62 chunks, still countable.
+  auto maximal_chunks = mdio::ChunkRange::Create({0}, {kIndexMax}, {2});
+  ASSERT_TRUE(maximal_chunks.ok()) << maximal_chunks.status();
+  EXPECT_EQ(maximal_chunks->size(), std::size_t{1} << 62);
+
+  // origin + shape beyond the Index range would overflow the domain-end
+  // arithmetic; reject it with a clear error.
+  auto domain_end_overflow =
+      mdio::ChunkRange::Create({1}, {kIndexMax}, {1});
+  EXPECT_FALSE(domain_end_overflow.ok());
+  EXPECT_THAT(domain_end_overflow.status().message(),
+              ::testing::HasSubstr("exceeds the index range"));
+
+  // A rank-2 grid of unit chunks over astronomically large domains would
+  // wrap the size_t chunk counter; reject it outright.
+  const mdio::Index kLarge = static_cast<mdio::Index>(1) << 40;
+  auto total_overflow =
+      mdio::ChunkRange::Create({0, 0}, {kLarge, kLarge}, {1, 1});
+  EXPECT_FALSE(total_overflow.ok());
+  EXPECT_THAT(total_overflow.status().message(),
+              ::testing::HasSubstr("too many chunks"));
+}
+
 TEST(ChunkRange, stlCompatibility) {
   auto chunks = mdio::ChunkRange::Create({0, 0}, {10, 10}, {4, 4});
   ASSERT_TRUE(chunks.ok()) << chunks.status();
@@ -1544,7 +1607,7 @@ class VariableVersionTest
  protected:
   void SetUp() override {
     version_ = GetParam();
-    base_path_ = GetBasePath(version_);
+    base_path_ = TestStorePath(GetBasePath(version_));
     std::filesystem::remove_all(base_path_);
   }
 
@@ -1565,7 +1628,8 @@ TEST_P(VariableVersionTest, open) {
   EXPECT_THAT(variable->dimensions().labels(),
               ::testing::ElementsAre("x", "y"));
   EXPECT_EQ(variable->dtype(), mdio::constants::kInt16);
-  EXPECT_EQ(variable->get_variable_name(), base_path_);
+  // The variable name is the kvstore path's basename.
+  EXPECT_EQ(variable->get_variable_name(), GetBasePath(version_));
   EXPECT_EQ(variable->get_long_name(), std::string("foooooo ....."));
 }
 

@@ -21,13 +21,26 @@
 
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide on fixed store names.
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 // clang-format off
-::nlohmann::json json_good = {
+::nlohmann::json json_good() {
+  return {
     {"driver", "zarr"},
     {"kvstore",
         {
             {"driver", "file"},
-            {"path", "collectionVariable"}
+            {"path", TestStorePath("collectionVariable")}
         }
     },
     {"attributes",
@@ -53,9 +66,10 @@ namespace {
         }
     }
 };
+}  // ends the file-local fixture namespace
 
 TEST(VariableCollectionTest, add) {
-    auto variable = mdio::Variable<>::Open(json_good,
+    auto variable = mdio::Variable<>::Open(json_good(),
                                            mdio::constants::kCreateClean);
     ASSERT_TRUE(variable.status().ok()) << variable.status();
 
@@ -66,7 +80,7 @@ TEST(VariableCollectionTest, add) {
 }
 
 TEST(VariableCollectionTest, get) {
-    auto variable = mdio::Variable<>::Open(json_good,
+    auto variable = mdio::Variable<>::Open(json_good(),
                                            mdio::constants::kCreateClean);
     ASSERT_TRUE(variable.status().ok()) << variable.status();
 
@@ -88,7 +102,7 @@ TEST(VariableCollectionTest, get) {
 }
 
 TEST(VariableCollectionTest, containsKey) {
-    auto variable = mdio::Variable<>::Open(json_good,
+    auto variable = mdio::Variable<>::Open(json_good(),
                                            mdio::constants::kCreateClean);
     ASSERT_TRUE(variable.status().ok()) << variable.status();
 
@@ -103,7 +117,7 @@ TEST(VariableCollectionTest, containsKey) {
 }
 
 TEST(VariableCollectionTest, getKeys) {
-    auto variable = mdio::Variable<>::Open(json_good,
+    auto variable = mdio::Variable<>::Open(json_good(),
                                            mdio::constants::kCreateClean);
     ASSERT_TRUE(variable.status().ok()) << variable.status();
 

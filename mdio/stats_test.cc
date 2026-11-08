@@ -37,10 +37,22 @@
 
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide on fixed store names.
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 auto getCenterHist() {
   std::vector<float> binCenters = {1.0, 2.0, 3.0};
   std::vector<int32_t> counts = {1, 2, 3};
-  return std::make_unique<mdio::internal::CenteredBinHistogram<float>>(
+  return std::make_unique<mdio::CenteredBinHistogram<float>>(
       binCenters, counts);
 }
 
@@ -48,7 +60,7 @@ auto getEdgeHist() {
   std::vector<float> binEdges = {0.0, 1.0, 2.0, 3.0};
   std::vector<float> binWidths = {1.0, 1.0, 1.0};
   std::vector<int32_t> counts = {1, 2, 3};
-  return std::make_unique<mdio::internal::EdgeDefinedHistogram<float>>(
+  return std::make_unique<mdio::EdgeDefinedHistogram<float>>(
       binEdges, binWidths, counts);
 }
 
@@ -83,7 +95,7 @@ TEST(HistogramTest, edgeDefinedHistogramClone) {
 TEST(HistogramTest, centeredFromJSON) {
   nlohmann::json expected = {
       {"histogram", {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}};
-  auto inertHist = mdio::internal::CenteredBinHistogram<float>({}, {});
+  auto inertHist = mdio::CenteredBinHistogram<float>({}, {});
   auto attrsRes = inertHist.FromJson(expected);
   ASSERT_TRUE(attrsRes.status().ok()) << attrsRes.status();
   auto histogram = std::move(attrsRes.value());
@@ -95,7 +107,7 @@ TEST(HistogramTest, edgeFromJSON) {
                               {{"binEdges", {0.0, 1.0, 2.0, 3.0}},
                                {"binWidths", {1.0, 1.0, 1.0}},
                                {"counts", {1, 2, 3}}}}};
-  auto inertHist = mdio::internal::EdgeDefinedHistogram<float>({}, {}, {});
+  auto inertHist = mdio::EdgeDefinedHistogram<float>({}, {}, {});
   auto attrsRes = inertHist.FromJson(expected);
   ASSERT_TRUE(attrsRes.status().ok()) << attrsRes.status();
   auto histogram = std::move(attrsRes.value());
@@ -110,7 +122,7 @@ TEST(SummaryStatsTest, fromJson) {
       {"sum", 0.0},
       {"sumSquares", 0.0},
       {"histogram", {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}};
-  auto statsRes = mdio::internal::SummaryStats::FromJson(expected);
+  auto statsRes = mdio::SummaryStats::FromJson(expected);
   ASSERT_TRUE(statsRes.status().ok()) << statsRes.status();
   auto stats = statsRes.value();
   EXPECT_EQ(stats.getBindable(), expected);
@@ -124,7 +136,7 @@ TEST(SummaryStatsTest, fromJsonInt) {
       {"sum", 0},
       {"sumSquares", 0},
       {"histogram", {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}};
-  auto statsRes = mdio::internal::SummaryStats::FromJson<int32_t>(expected);
+  auto statsRes = mdio::SummaryStats::FromJson<int32_t>(expected);
   ASSERT_TRUE(statsRes.status().ok()) << statsRes.status();
   auto stats = statsRes.value();
   EXPECT_EQ(stats.getBindable(), expected);
@@ -138,7 +150,7 @@ TEST(SummaryStatsTest, fromJsonMissing) {
       {"sum", 0.0},
       {"sumSquares", 0.0},
       {"histogram", {{"binCenters", {1.0, 2.0, 3.0}}, {"counts", {1, 2, 3}}}}};
-  auto statsRes = mdio::internal::SummaryStats::FromJson(expected);
+  auto statsRes = mdio::SummaryStats::FromJson(expected);
   ASSERT_FALSE(statsRes.status().ok()) << statsRes.status();
 }
 
@@ -541,7 +553,7 @@ TEST(HistogramTest, isBindable) {
 
 TEST(HistogramTest, fromJsonErrorPaths) {
   nlohmann::json noParent = {{"binCenters", {1.0, 2.0}}, {"counts", {1, 2}}};
-  auto centered = mdio::internal::CenteredBinHistogram<float>({}, {});
+  auto centered = mdio::CenteredBinHistogram<float>({}, {});
   EXPECT_FALSE(centered.FromJson(noParent).status().ok());
 
   nlohmann::json noChild = {{"histogram", {{"counts", {1, 2}}}}};
@@ -549,7 +561,7 @@ TEST(HistogramTest, fromJsonErrorPaths) {
 
   nlohmann::json edgeNoParent = {
       {"binEdges", {0.0, 1.0}}, {"binWidths", {1.0}}, {"counts", {1}}};
-  auto edge = mdio::internal::EdgeDefinedHistogram<float>({}, {}, {});
+  auto edge = mdio::EdgeDefinedHistogram<float>({}, {}, {});
   EXPECT_FALSE(edge.FromJson(edgeNoParent).status().ok());
 
   nlohmann::json edgeNoChild = {
@@ -612,7 +624,7 @@ TEST(SummaryStatsTest, fromJsonEdgeHistogramAndMissingHistogram) {
                                {{"binEdges", {0.0, 1.0, 2.0}},
                                 {"binWidths", {1.0, 1.0}},
                                 {"counts", {10, 20}}}}};
-  auto statsRes = mdio::internal::SummaryStats::FromJson(edgeStats);
+  auto statsRes = mdio::SummaryStats::FromJson(edgeStats);
   ASSERT_TRUE(statsRes.status().ok()) << statsRes.status();
   EXPECT_TRUE(statsRes.value().getBindable()["histogram"].contains("binEdges"));
 
@@ -621,7 +633,7 @@ TEST(SummaryStatsTest, fromJsonEdgeHistogramAndMissingHistogram) {
                            {"max", 100.0},
                            {"sum", 50.0},
                            {"sumSquares", 500.0}};
-  EXPECT_FALSE(mdio::internal::SummaryStats::FromJson(noHist).status().ok());
+  EXPECT_FALSE(mdio::SummaryStats::FromJson(noHist).status().ok());
 }
 
 TEST(UserAttributesTest, fromJsonWrongTypedStatsV1NamesTheField) {
@@ -751,7 +763,7 @@ constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
   ::nlohmann::json spec;
   spec["driver"] = "zarr3";
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["metadata"]["data_type"] = dataType;
   spec["metadata"]["shape"] = shape;
   spec["metadata"]["chunk_grid"]["name"] = "regular";
@@ -807,17 +819,17 @@ std::vector<float> SequentialValues(const float first, const std::size_t count) 
   return values;
 }
 
-std::unique_ptr<mdio::internal::CenteredBinHistogram<float>> MakeCenteredHist(
+std::unique_ptr<mdio::CenteredBinHistogram<float>> MakeCenteredHist(
     const std::vector<float>& binCenters, const std::vector<int32_t>& counts) {
-  return std::make_unique<mdio::internal::CenteredBinHistogram<float>>(
+  return std::make_unique<mdio::CenteredBinHistogram<float>>(
       binCenters, counts);
 }
 
-mdio::Result<mdio::internal::SummaryStats> MakePartial(
+mdio::Result<mdio::SummaryStats> MakePartial(
     const int32_t count, const float min, const float max, const float sum,
     const float sumSquares, const std::vector<float>& binCenters,
     const std::vector<int32_t>& counts) {
-  return mdio::internal::SummaryStats::Create(count, max, min, sum, sumSquares,
+  return mdio::SummaryStats::Create(count, max, min, sum, sumSquares,
                                               MakeCenteredHist(binCenters, counts));
 }
 
@@ -1026,10 +1038,11 @@ TEST(ComputeStatsTest, UnsupportedDtypeIsRejected) {
           }
       }
   )";
+  auto specJson = ::nlohmann::json::parse(spec);
+  specJson["kvstore"]["path"] = TestStorePath("stats_test_struct");
   TENSORSTORE_ASSERT_OK_AND_ASSIGN(
       auto variable,
-      mdio::Variable<>::Open(::nlohmann::json::parse(spec),
-                             mdio::constants::kCreateClean)
+      mdio::Variable<>::Open(specJson, mdio::constants::kCreateClean)
           .result());
   auto statsRes = mdio::ComputeStats(variable);
   EXPECT_FALSE(statsRes.status().ok()) << statsRes.status();
@@ -1072,7 +1085,7 @@ TEST(MergeStatsTest, PartialsEqualSinglePassComputation) {
   auto partialCRes = mdio::ComputeStats(partC, centers);
   ASSERT_TRUE(partialCRes.status().ok()) << partialCRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> partials = {
+  const std::vector<mdio::SummaryStats> partials = {
       partialARes.value(), partialBRes.value(), partialCRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(partials));
   ASSERT_TRUE(mergedRes.status().ok()) << mergedRes.status();
@@ -1112,11 +1125,11 @@ TEST(MergeStatsTest, PermutationsOfPartialsGiveSameResult) {
   auto partialCRes = mdio::ComputeStats(partC, centers);
   ASSERT_TRUE(partialCRes.status().ok()) << partialCRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> order123 = {
+  const std::vector<mdio::SummaryStats> order123 = {
       partialARes.value(), partialBRes.value(), partialCRes.value()};
-  const std::vector<mdio::internal::SummaryStats> order321 = {
+  const std::vector<mdio::SummaryStats> order321 = {
       partialCRes.value(), partialBRes.value(), partialARes.value()};
-  const std::vector<mdio::internal::SummaryStats> order213 = {
+  const std::vector<mdio::SummaryStats> order213 = {
       partialBRes.value(), partialARes.value(), partialCRes.value()};
 
   auto merged123Res = mdio::MergeStats(absl::MakeConstSpan(order123));
@@ -1150,14 +1163,14 @@ TEST(MergeStatsTest, DefaultBinnedPartialsCannotMerge) {
   auto partialBRes = mdio::ComputeStats(partB);
   ASSERT_TRUE(partialBRes.status().ok()) << partialBRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> partials = {
+  const std::vector<mdio::SummaryStats> partials = {
       partialARes.value(), partialBRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(partials));
   EXPECT_FALSE(mergedRes.status().ok()) << mergedRes.status();
 }
 
 TEST(MergeStatsTest, EmptySpanIsRejected) {
-  const std::vector<mdio::internal::SummaryStats> noPartials;
+  const std::vector<mdio::SummaryStats> noPartials;
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(noPartials));
   EXPECT_FALSE(mergedRes.status().ok()) << mergedRes.status();
 }
@@ -1169,14 +1182,14 @@ TEST(MergeStatsTest, NeutralPartialsContributeNothing) {
   auto neutralRes = MakePartial(0, 0.0F, 0.0F, 0.0F, 0.0F, {}, {});
   ASSERT_TRUE(neutralRes.status().ok()) << neutralRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> withNeutral = {
+  const std::vector<mdio::SummaryStats> withNeutral = {
       neutralRes.value(), realRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(withNeutral));
   ASSERT_TRUE(mergedRes.status().ok()) << mergedRes.status();
   EXPECT_EQ(mergedRes.value().getBindable(), realRes.value().getBindable());
 
   // A merge of only neutral partials is the canonical empty statsV1.
-  const std::vector<mdio::internal::SummaryStats> onlyNeutral = {
+  const std::vector<mdio::SummaryStats> onlyNeutral = {
       neutralRes.value(), neutralRes.value()};
   auto emptyRes = mdio::MergeStats(absl::MakeConstSpan(onlyNeutral));
   ASSERT_TRUE(emptyRes.status().ok()) << emptyRes.status();
@@ -1193,7 +1206,7 @@ TEST(MergeStatsTest, EmptyHistogramPartialsMergeScalarsOnly) {
   auto secondRes = MakePartial(6, 2.0F, 12.0F, 42.0F, 394.0F, {}, {});
   ASSERT_TRUE(secondRes.status().ok()) << secondRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> partials = {
+  const std::vector<mdio::SummaryStats> partials = {
       firstRes.value(), secondRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(partials));
   ASSERT_TRUE(mergedRes.status().ok()) << mergedRes.status();
@@ -1213,7 +1226,7 @@ TEST(MergeStatsTest, MixedHistogramAndNonHistogramIsRejected) {
   auto withoutHistRes = MakePartial(4, 1.0F, 8.0F, 18.0F, 130.0F, {}, {});
   ASSERT_TRUE(withoutHistRes.status().ok()) << withoutHistRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> partials = {
+  const std::vector<mdio::SummaryStats> partials = {
       withHistRes.value(), withoutHistRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(partials));
   EXPECT_FALSE(mergedRes.status().ok()) << mergedRes.status();
@@ -1222,18 +1235,18 @@ TEST(MergeStatsTest, MixedHistogramAndNonHistogramIsRejected) {
 TEST(MergeStatsTest, EdgeDefinedHistogramsMergeCounts) {
   const std::vector<float> binEdges = {0.0F, 10.0F, 20.0F};
   const std::vector<float> binWidths = {10.0F, 10.0F};
-  auto firstRes = mdio::internal::SummaryStats::Create(
+  auto firstRes = mdio::SummaryStats::Create(
       5, 18.0F, 2.0F, 50.0F, 700.0F,
-      std::make_unique<mdio::internal::EdgeDefinedHistogram<float>>(
+      std::make_unique<mdio::EdgeDefinedHistogram<float>>(
           binEdges, binWidths, std::vector<int32_t>{3, 2}));
   ASSERT_TRUE(firstRes.status().ok()) << firstRes.status();
-  auto secondRes = mdio::internal::SummaryStats::Create(
+  auto secondRes = mdio::SummaryStats::Create(
       4, 12.0F, 1.0F, 30.0F, 400.0F,
-      std::make_unique<mdio::internal::EdgeDefinedHistogram<float>>(
+      std::make_unique<mdio::EdgeDefinedHistogram<float>>(
           binEdges, binWidths, std::vector<int32_t>{1, 3}));
   ASSERT_TRUE(secondRes.status().ok()) << secondRes.status();
 
-  const std::vector<mdio::internal::SummaryStats> partials = {
+  const std::vector<mdio::SummaryStats> partials = {
       firstRes.value(), secondRes.value()};
   auto mergedRes = mdio::MergeStats(absl::MakeConstSpan(partials));
   ASSERT_TRUE(mergedRes.status().ok()) << mergedRes.status();
@@ -1247,7 +1260,7 @@ TEST(MergeStatsTest, EdgeDefinedHistogramsMergeCounts) {
 }
 
 TEST(ComputeStatsTest, PublishingFlowRoundTrip) {
-  const std::string path = "stats_test_publishing";
+  const std::string path = TestStorePath("stats_test_publishing");
   std::filesystem::remove_all(path);
   const std::string schema = R"(
       {
