@@ -1607,9 +1607,12 @@ class Variable : public VariableBase {
    * @return An `mdio::Result` object containing the chunk range; the same
    * errors as the vector overload.
    */
-  template <typename... DimensionIdentifier>
-  Result<ChunkRange> chunks(const DimensionIdentifier&... dims) const {
-    return chunks(std::vector<mdio::DimensionIdentifier>({dims...}));
+  template <typename... DimensionIdentifierArg>
+  Result<ChunkRange> chunks(const DimensionIdentifierArg&... dims) const {
+    std::vector<mdio::DimensionIdentifier> identifiers;
+    identifiers.reserve(sizeof...(dims));
+    (identifiers.emplace_back(dims), ...);
+    return chunks(identifiers);
   }
 
   /**
