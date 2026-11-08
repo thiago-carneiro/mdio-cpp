@@ -26,11 +26,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <nlohmann/json.hpp>  // NOLINT
 #include <sstream>            // NOLINT
+#include <string>
 
 #include "mdio/dataset.h"
 #include "mdio/dataset_factory.h"
@@ -41,6 +43,13 @@ namespace {
 constexpr char PYTHON_EXECUTABLE[] = "python3";
 constexpr char PROJECT_BASE_PATH_ENV[] = "PROJECT_BASE_PATH";
 constexpr char DEFAULT_BASE_PATH[] = "../..";
+// Opt-in flag for cases that fetch remote data over the network. The default
+// suite must run hermetically; see NetworkTestsEnabled().
+constexpr char NETWORK_TESTS_ENV[] = "MDIO_NETWORK_TESTS";
+// Probe used to validate a candidate project root when locating the Python
+// regression scripts.
+constexpr char REGRESSION_TESTS_PROBE_RELATIVE_PATH[] =
+    "mdio/regression_tests/xarray_compatibility_test.py";
 constexpr char XARRAY_SCRIPT_RELATIVE_PATH[] =
     "/mdio/regression_tests/xarray_compatibility_test.py";
 constexpr char MULTIDIMIO_SCRIPT_RELATIVE_PATH[] =
@@ -195,17 +204,72 @@ mdio::Future<mdio::Variable<>> OpenTestVariable(const std::string& name,
 }
 
 /**
- * @brief Gets the Python script base path from environment.
+ * @brief Checks whether the Python regression scripts are present under a
+ * candidate project root.
  */
-const char* GetPythonBasePath() {
-  const char* basePath = std::getenv(PROJECT_BASE_PATH_ENV);
-  if (!basePath) {
-    std::cout << "PROJECT_BASE_PATH environment variable not set. Expecting to "
-                 "be in the 'build/mdio' directory."
-              << std::endl;
-    basePath = DEFAULT_BASE_PATH;
+bool HasRegressionScripts(const std::string& base_path) {
+  std::error_code probe_error;
+  const std::filesystem::path probe =
+      std::filesystem::path(base_path) / REGRESSION_TESTS_PROBE_RELATIVE_PATH;
+  return std::filesystem::exists(probe, probe_error);
+}
+
+/**
+ * @brief Resolves the project root used to locate the Python regression
+ * scripts, independent of the current working directory.
+ *
+ * Resolution order:
+ *   1. PROJECT_BASE_PATH environment variable (explicit override).
+ *   2. The repository root inferred from the test binary location
+ *      (/proc/self/exe): the binary lives at <root>/build/mdio, so the root is
+ *      three levels up from the binary file.
+ *   3. The historical CWD-relative default "../..", valid when running from
+ *      build/mdio.
+ */
+std::string GetPythonBasePath() {
+  const char* override_base = std::getenv(PROJECT_BASE_PATH_ENV);
+  if (override_base != nullptr && *override_base != '\0') {
+    return override_base;
   }
-  return basePath;
+
+  std::error_code self_error;
+  const std::filesystem::path self =
+      std::filesystem::read_symlink("/proc/self/exe", self_error);
+  if (!self_error) {
+    const std::filesystem::path root =
+        self.parent_path().parent_path().parent_path();
+    const std::string root_str = root.lexically_normal().string();
+    if (HasRegressionScripts(root_str)) {
+      return root_str;
+    }
+  }
+
+  std::cout
+      << "PROJECT_BASE_PATH not set and the repository root could not be "
+         "inferred from the binary location; falling back to the relative "
+         "default '../..' (valid when running from build/mdio)."
+      << std::endl;
+  return DEFAULT_BASE_PATH;
+}
+
+/**
+ * @brief Whether network-dependent cases are opted in via MDIO_NETWORK_TESTS.
+ *
+ * The multidimio compatibility case ingests a remote SEG-Y hosted on S3, so it
+ * is skipped unless explicitly enabled. The variable counts as enabled when
+ * set to anything other than an empty value or 0/false/off/no.
+ */
+bool NetworkTestsEnabled() {
+  const char* value = std::getenv(NETWORK_TESTS_ENV);
+  if (value == nullptr) {
+    return false;
+  }
+  std::string flag = value;
+  for (char& c : flag) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return !flag.empty() && flag != "0" && flag != "false" && flag != "off" &&
+         flag != "no";
 }
 
 /**
@@ -1244,7 +1308,7 @@ TEST_P(DatasetTest, fillValueParityWithPython) {
   const bool is_v3 = version_ == mdio::zarr::ZarrVersion::kV3;
 
   std::string srcPath =
-      std::string(GetPythonBasePath()) + FILL_VALUE_PARITY_SCRIPT_RELATIVE_PATH;
+      GetPythonBasePath() + FILL_VALUE_PARITY_SCRIPT_RELATIVE_PATH;
   if (access(srcPath.c_str(), F_OK) == -1) {
     FAIL() << "Script not found: " << srcPath;
   }
@@ -1394,8 +1458,7 @@ TEST_P(XarrayCompatibilityTest, datasetCompatible) {
                                      mdio::constants::kCreateClean);
   ASSERT_TRUE(ds.status().ok()) << ds.status();
 
-  std::string srcPath =
-      std::string(GetPythonBasePath()) + XARRAY_SCRIPT_RELATIVE_PATH;
+  std::string srcPath = GetPythonBasePath() + XARRAY_SCRIPT_RELATIVE_PATH;
 
   if (access(srcPath.c_str(), F_OK) == -1) {
     std::cerr << "Error: Python script not found at " << srcPath << std::endl;
@@ -1454,6 +1517,16 @@ TEST_P(MultidimioCompatibilityTest, datasetCompatible) {
   // SEG-Y dataset to an MDIO dataset. The python ingestion honors the requested
   // Zarr format via the ZARR_DEFAULT_ZARR_FORMAT environment variable, which
   // the forked interpreter inherits.
+  //
+  // The sample SEG-Y is fetched from a remote S3 bucket, so this case only
+  // runs when explicitly opted in via MDIO_NETWORK_TESTS; the default suite
+  // stays network-independent.
+  if (!NetworkTestsEnabled()) {
+    GTEST_SKIP()
+        << "Ingests a remote SEG-Y hosted on S3 (network access required); "
+           "skipped by default so the suite runs hermetically. Set "
+        << NETWORK_TESTS_ENV << "=1 to enable this case.";
+  }
   std::string test_path = base_path_ + "/multidimio_compat";
   std::filesystem::remove_all(test_path);
 
@@ -1478,7 +1551,8 @@ TEST_P(MultidimioCompatibilityTest, datasetCompatible) {
   unsetenv("ZARR_DEFAULT_ZARR_FORMAT");
 
   if (script_status == PythonScriptStatus::kSkipped) {
-    GTEST_SKIP() << "Multidimio compatibility skipped due to import error";
+    GTEST_SKIP() << "Multidimio compatibility skipped: the regression script "
+                    "requested a skip (see its output above for the reason)";
   }
   ASSERT_EQ(script_status, PythonScriptStatus::kPassed)
       << "multidimio compatibility test failed";

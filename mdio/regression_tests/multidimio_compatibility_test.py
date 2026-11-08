@@ -43,7 +43,28 @@ def _apply_requested_zarr_format():
         zarr.config.set({"default_zarr_format": int(zarr_format)})
 
 
+def _network_tests_enabled():
+    """Whether network-dependent ingestion was opted in via MDIO_NETWORK_TESTS.
+
+    The default SEG-Y source is a remote S3 download, so the test refuses to
+    touch the network unless explicitly enabled. Mirrors the C++ harness
+    truthiness in mdio/acceptance_test.cc.
+    """
+    value = os.environ.get("MDIO_NETWORK_TESTS")
+    if value is None:
+        return False
+    return value.strip().lower() not in ("", "0", "false", "off", "no")
+
+
 def test_multidimio_ingestion(output_path):
+    if not _network_tests_enabled():
+        print(
+            "Skipping: the sample SEG-Y is fetched from a remote S3 bucket "
+            "(network access required). Set MDIO_NETWORK_TESTS=1 to enable "
+            "this test."
+        )
+        return 0xFD
+
     os.environ["MDIO__IMPORT__CLOUD_NATIVE"] = "true"
     os.environ["MDIO__IMPORT__SAVE_SEGY_FILE_HEADER"] = "true"
 
