@@ -16,10 +16,16 @@
 
 #define MDIO_API_VERSION "1.0.0"
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -208,6 +214,161 @@ inline void WarnOnMissingDatasetMetadata(const ::nlohmann::json& metadata,
       << absl::StrJoin(missing, ", ")
       << ". Continuing without them; these fields are informational and do "
          "not affect how the dataset is read.";
+}
+
+/**
+ * @brief Single-pass depth-first removal of a directory subtree, relative
+ * to an open parent directory.
+ *
+ * Enumerates each directory exactly once: entries are unlinked as they
+ * are read (trusting readdir d_type, so no per-entry probe openat),
+ * sub-directories recurse and are unlinked bottom-up on unwind. This
+ * avoids both tensorstore's per-file ENOTDIR probe openat and
+ * libstdc++'s remove_all second pass (which re-opens and re-enumerates
+ * every directory before removing it).
+ *
+ * Best effort: entries that cannot be removed are left in place; the
+ * stock per-variable DeleteRange that follows remains the backstop.
+ */
+inline bool SinglePassRemoveTree(int parent_fd, const char* name) {
+  int fd = ::openat(parent_fd, name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) {
+    return errno == ENOENT;  // Already gone: nothing to remove.
+  }
+  ::DIR* dir = ::fdopendir(fd);  // Takes ownership of fd on success.
+  if (dir == nullptr) {
+    ::close(fd);
+    return false;
+  }
+  bool ok = true;
+  while (true) {
+    errno = 0;
+    struct ::dirent* entry = ::readdir(dir);
+    if (entry == nullptr) {
+      if (errno != 0) {
+        ok = false;
+      }
+      break;
+    }
+    if (::strcmp(entry->d_name, ".") == 0 ||
+        ::strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    if (entry->d_type == DT_DIR) {
+      ok = SinglePassRemoveTree(fd, entry->d_name) && ok;
+      if (::unlinkat(fd, entry->d_name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+        ok = false;
+      }
+    } else if (entry->d_type == DT_UNKNOWN) {
+      // d_type not populated: try file first, then directory.
+      if (::unlinkat(fd, entry->d_name, 0) != 0) {
+        if (errno == EISDIR) {
+          ok = SinglePassRemoveTree(fd, entry->d_name) && ok;
+          if (::unlinkat(fd, entry->d_name, AT_REMOVEDIR) != 0 &&
+              errno != ENOENT) {
+            ok = false;
+          }
+        } else if (errno != ENOENT) {
+          ok = false;
+        }
+      }
+    } else {
+      if (::unlinkat(fd, entry->d_name, 0) != 0 && errno != ENOENT) {
+        ok = false;
+      }
+    }
+  }
+  ::closedir(dir);
+  return ok;
+}
+
+/**
+ * @brief Best-effort fast teardown of a local store before a kCreateClean
+ * open.
+ *
+ * tensorstore's `delete_existing` pass deletes a file-kvstore range by
+ * walking it with one `openat(O_DIRECTORY)` per entry: every chunk file
+ * costs one failed (ENOTDIR) openat plus its unlinkat, and on NFS that
+ * probe dominated the recreate wall time (measured: ~8.1k openat for a
+ * 6.1k-file store, recreate ~13x a fresh create). This helper removes
+ * the store contents first with SinglePassRemoveTree, which trusts
+ * readdir d_type and enumerates each directory exactly once, so the
+ * subsequent stock DeleteRange finds nothing left to walk.
+ *
+ * The store root directory itself is kept so the observable semantics
+ * match the stock pass (root inode stays valid, symlinked and
+ * non-directory roots behave the same); anything the fast pass could not
+ * remove is still handled by the stock per-variable DeleteRange that
+ * follows, which therefore remains the semantic backstop.
+ *
+ * Applies only when every variable spec is a local-file kvstore sharing
+ * one parent directory; anything else (cloud stores, unexpected layout)
+ * keeps the stock behavior untouched.
+ */
+inline void BestEffortPreDeleteLocalStore(
+    const std::vector<::nlohmann::json>& json_variables) {
+  std::optional<std::string> store_root;
+  for (const auto& json : json_variables) {
+    if (!json.contains("kvstore")) {
+      return;
+    }
+    const auto& kvstore = json["kvstore"];
+    if (!kvstore.contains("driver") || !kvstore.contains("path") ||
+        !kvstore["driver"].is_string() || !kvstore["path"].is_string() ||
+        kvstore["driver"].get<std::string>() != "file") {
+      return;  // Cloud or malformed spec: keep the stock delete path.
+    }
+    std::filesystem::path var_path(kvstore["path"].get<std::string>());
+    std::string parent = var_path.parent_path().string();
+    if (parent.empty()) {
+      return;  // Unexpected layout; keep the stock delete path.
+    }
+    if (!store_root) {
+      store_root = parent;
+    } else if (*store_root != parent) {
+      return;  // Variables disagree on the dataset root; keep stock path.
+    }
+  }
+  if (!store_root) {
+    return;
+  }
+  // Remove the children of the root, keeping the root directory itself
+  // (matching the stock DeleteRange, which never deletes the kvstore
+  // root, only its contents).
+  int root_fd = ::open(store_root->c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (root_fd < 0) {
+    return;  // Root missing: nothing to delete; stock path preserves
+             // the open semantics.
+  }
+  ::DIR* root_dir = ::fdopendir(root_fd);
+  if (root_dir == nullptr) {
+    ::close(root_fd);
+    return;
+  }
+  while (true) {
+    errno = 0;
+    struct ::dirent* entry = ::readdir(root_dir);
+    if (entry == nullptr) {
+      break;  // Errors inside SinglePassRemoveTree stay best-effort.
+    }
+    if (::strcmp(entry->d_name, ".") == 0 ||
+        ::strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+    if (entry->d_type == DT_DIR) {
+      SinglePassRemoveTree(root_fd, entry->d_name);
+      ::unlinkat(root_fd, entry->d_name, AT_REMOVEDIR);
+    } else if (entry->d_type == DT_UNKNOWN) {
+      if (::unlinkat(root_fd, entry->d_name, 0) != 0 && errno == EISDIR) {
+        SinglePassRemoveTree(root_fd, entry->d_name);
+        ::unlinkat(root_fd, entry->d_name, AT_REMOVEDIR);
+      }
+    } else {
+      ::unlinkat(root_fd, entry->d_name, 0);
+    }
+  }
+  ::closedir(root_dir);
 }
 
 // ==========================================================================
@@ -1515,6 +1676,13 @@ class Dataset {
         tensorstore::internal::SetAll(transact_options, options...));
     bool do_create = transact_options.open_mode == constants::kCreateClean ||
                      transact_options.open_mode == constants::kCreate;
+    if (transact_options.open_mode == constants::kCreateClean &&
+        transact_options.transaction == tensorstore::no_transaction) {
+      // Fast-path the `delete_existing` teardown for local stores; the
+      // stock per-variable DeleteRange below stays as the backstop (see
+      // BestEffortPreDeleteLocalStore documentation).
+      internal::BestEffortPreDeleteLocalStore(json_variables);
+    }
 
     // Extract context from options for metadata writing
     tensorstore::Context context = transact_options.context;
