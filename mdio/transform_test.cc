@@ -34,6 +34,18 @@
 
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide on fixed store names.
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 /// Builds a Zarr V3 variable spec (the format mdio-python defaults to).
 /// `chunks` defaults to `shape`; Zarr V3 requires chunk entries >= 1, so
 /// zero-length dimensions must pass an explicit unit chunk.
@@ -44,7 +56,7 @@ namespace {
   ::nlohmann::json spec;
   spec["driver"] = "zarr3";
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["metadata"]["data_type"] = dataType;
   spec["metadata"]["shape"] = shape;
   spec["metadata"]["chunk_grid"]["name"] = "regular";
@@ -73,7 +85,7 @@ namespace {
   ::nlohmann::json spec;
   spec["driver"] = "zarr";
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["metadata"]["compressor"] = {{"id", "blosc"}};
   spec["metadata"]["dtype"] = dtype;
   spec["metadata"]["shape"] = shape;
@@ -97,7 +109,7 @@ namespace {
   ::nlohmann::json spec;
   spec["driver"] = "zarr";
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["metadata"]["compressor"] = {{"id", "blosc"}};
   spec["metadata"]["dtype"] = ::nlohmann::json::array({
       ::nlohmann::json::array({"a", "<i2"}),
@@ -120,7 +132,7 @@ namespace {
   ::nlohmann::json spec;
   spec["driver"] = "zarr3";
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["metadata"]["data_type"] = {
       {"name", "struct"},
       {"configuration",
@@ -249,7 +261,7 @@ mdio::Result<mdio::Variable<>> OpenVoidView(const std::string& name,
   ::nlohmann::json spec;
   spec["driver"] = driver;
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   return mdio::Variable<>::Open(spec).result();
 }
 
@@ -261,7 +273,7 @@ mdio::Result<mdio::Variable<T>> OpenStructField(const std::string& name,
   ::nlohmann::json spec;
   spec["driver"] = driver;
   spec["kvstore"]["driver"] = "file";
-  spec["kvstore"]["path"] = name;
+  spec["kvstore"]["path"] = TestStorePath(name);
   spec["field"] = field;
   return mdio::Variable<T>::Open(spec).result();
 }

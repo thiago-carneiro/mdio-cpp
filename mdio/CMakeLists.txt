@@ -49,12 +49,27 @@ target_include_directories(mdio INTERFACE
 )
 
 # Link dependencies
-# NOTE: Abseil libraries (e.g. absl::log used by dataset.h) are provided
+# absl::log is required because the public header dataset.h uses ABSL_LOG;
+# consumers of this target must receive the dependency instead of relying on
+# tensorstore's transitive Abseil. The EXT_ABSL::log imported indirection
+# mirrors EXT_TENSORSTORE::tensorstore: the build-tree target resolves to the
+# absl::log built alongside tensorstore, and exported consumers resolve
+# EXT_ABSL::log themselves (a direct absl::log reference would force the
+# whole Abseil build closure into the mdio export set).
+# Other Abseil libraries (e.g. absl/strings usage in dataset_factory.h) come
 # transitively through EXT_TENSORSTORE::tensorstore, matching the existing
-# convention for absl/strings usage in dataset_factory.h.
+# convention.
+if(NOT TARGET EXT_ABSL::log)
+  add_library(EXT_ABSL::log INTERFACE IMPORTED)
+  if(TARGET absl::log)
+    set_target_properties(EXT_ABSL::log PROPERTIES
+      INTERFACE_LINK_LIBRARIES absl::log)
+  endif()
+endif()
 target_link_libraries(mdio INTERFACE
   EXT_TENSORSTORE::tensorstore
   nlohmann_json_schema_validator::nlohmann_json_schema_validator
+  EXT_ABSL::log
 )
 
 # Install the mdio target
@@ -313,7 +328,6 @@ mdio_cc_test(
     absl::log
     absl::log_initialize
     absl::log_sink
-    absl::log_internal_log_sink_set
 )
 
 mdio_cc_test(
@@ -414,7 +428,6 @@ mdio_cc_test(
     absl::log
     absl::log_initialize
     absl::log_sink
-    absl::log_internal_log_sink_set
 )
 
 mdio_cc_test(
