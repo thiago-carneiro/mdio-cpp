@@ -2246,15 +2246,68 @@ inline absl::Status AccumulateStatsDispatch(
 }
 
 /**
+ * @brief Rejects bin centers that are not strictly increasing.
+ *
+ * Pure input validation, callable before any I/O so a caller with invalid
+ * centers fails in microseconds instead of after a full-variable read.
+ */
+inline absl::Status ValidateBinCenters(absl::Span<const float> binCenters) {
+  for (std::size_t index = 1; index < binCenters.size(); ++index) {
+    if (binCenters[index] <= binCenters[index - 1]) {
+      return absl::InvalidArgumentError(
+          "ComputeStats: bin centers must be strictly increasing.");
+    }
+  }
+  return absl::OkStatus();
+}
+
+/**
+ * @brief Derives the default binning from the accumulated scalars and runs
+ * the second histogramming pass over the data.
+ *
+ * A constant variable gets a single bin; equal-width bins over a zero range
+ * would all share the same center. Note the two precision conventions this
+ * preserves: the constant-bin center is the float32-converted minimum, while
+ * the equal-width derivation uses the double accumulators.
+ *
+ * @param data Pointer to the first element of the flat buffer.
+ * @param numElements Number of elements in the buffer.
+ * @param dtype The variable's data type.
+ * @param scalars The first-pass scalar accumulator.
+ * @param minValue The float32-converted minimum (the constant-bin center).
+ * @param binCounts Receives the per-bin counts of the second pass.
+ * @return The derived bin centers.
+ */
+inline Result<std::vector<float>> DeriveDefaultBins(
+    const void* data, const std::size_t numElements, const DataType dtype,
+    const StatsAccumulator& scalars, const float minValue,
+    std::vector<int64_t>* binCounts) {
+  std::vector<float> centers;
+  if (scalars.min == scalars.max) {
+    centers.push_back(minValue);
+  } else {
+    centers = UniformBinCenters(scalars.min, scalars.max,
+                                kDefaultHistogramBinCount);
+  }
+  const std::vector<double> upperEdges = BinUpperEdges(centers);
+  binCounts->assign(centers.size(), 0);
+  MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(data, numElements, dtype,
+                                               &upperEdges, nullptr,
+                                               binCounts));
+  return Result<std::vector<float>>(centers);
+}
+
+/**
  * @brief Shared implementation of the two ComputeStats overloads.
  *
- * Reads the whole variable into memory (tensorstore::Read returns a
- * C-contiguous array), accumulates the scalar stats, and histograms either
- * in the same pass (explicit bin centers) or in a second pass (default bins
- * derived from the data range).
+ * Validates the bin centers before any I/O, then reads the whole variable
+ * into memory (tensorstore::Read returns a C-contiguous array), accumulates
+ * the scalar stats, and histograms either in the same pass (explicit bin
+ * centers) or in a second pass (default bins derived from the data range).
  */
 inline Result<SummaryStats> ComputeStatsImpl(
     const Variable<>& var, absl::Span<const float> binCenters) {
+  MDIO_RETURN_IF_ERROR(ValidateBinCenters(binCenters));
   MDIO_ASSIGN_OR_RETURN(auto array,
                         tensorstore::Read(var.get_store()).result());
   // tensorstore::Read allocates a fresh C-contiguous array, so a flat walk
@@ -2267,12 +2320,6 @@ inline Result<SummaryStats> ComputeStatsImpl(
   std::vector<int64_t> binCounts;
 
   if (!binCenters.empty()) {
-    for (std::size_t index = 1; index < binCenters.size(); ++index) {
-      if (binCenters[index] <= binCenters[index - 1]) {
-        return absl::InvalidArgumentError(
-            "ComputeStats: bin centers must be strictly increasing.");
-      }
-    }
     const std::vector<double> upperEdges = BinUpperEdges(binCenters);
     binCounts.assign(binCenters.size(), 0);
     MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
@@ -2284,10 +2331,7 @@ inline Result<SummaryStats> ComputeStatsImpl(
 
   if (scalars.count == 0) {
     // The canonical empty statsV1 (mdio-python convention).
-    return SummaryStats::Create(
-        0, 0.0F, 0.0F, 0.0F, 0.0F,
-        std::make_unique<CenteredBinHistogram<float>>(std::vector<float>(),
-                                                      std::vector<int32_t>()));
+    return EmptySummaryStats();
   }
 
   if (scalars.count >
@@ -2296,45 +2340,36 @@ inline Result<SummaryStats> ComputeStatsImpl(
         "ComputeStats: count " + std::to_string(scalars.count) +
         " exceeds the int32 statsV1 count field.");
   }
-  MDIO_ASSIGN_OR_RETURN(const float sumValue,
-                        CheckedFloat(scalars.sum, "sum"));
-  MDIO_ASSIGN_OR_RETURN(const float sumSquaresValue,
-                        CheckedFloat(scalars.sumSquares, "sumSquares"));
-  MDIO_ASSIGN_OR_RETURN(const float minValue, CheckedFloat(scalars.min, "min"));
-  MDIO_ASSIGN_OR_RETURN(const float maxValue, CheckedFloat(scalars.max, "max"));
+  MDIO_ASSIGN_OR_RETURN(
+      const CheckedStatsScalars scalarsF,
+      CheckStatsScalars(scalars.sum, scalars.sumSquares, scalars.min,
+                        scalars.max));
 
   std::vector<float> centers(binCenters.begin(), binCenters.end());
   if (centers.empty()) {
-    if (scalars.min == scalars.max) {
-      // A constant variable gets a single bin; equal-width bins over a zero
-      // range would all share the same center.
-      centers.push_back(minValue);
-    } else {
-      centers = UniformBinCenters(scalars.min, scalars.max,
-                                  kDefaultHistogramBinCount);
-    }
-    const std::vector<double> upperEdges = BinUpperEdges(centers);
-    binCounts.assign(centers.size(), 0);
-    MDIO_RETURN_IF_ERROR(AccumulateStatsDispatch(
-        data, numElements, var.dtype(), &upperEdges, nullptr, &binCounts));
+    MDIO_ASSIGN_OR_RETURN(
+        const std::vector<float> derivedBins,
+        DeriveDefaultBins(data, numElements, var.dtype(), scalars,
+                          scalarsF.min, &binCounts));
+    centers = derivedBins;
   }
 
   // Per-bin counts cannot overflow int32: each is at most the total count.
   const std::vector<int32_t> counts(binCounts.begin(), binCounts.end());
   auto histogram = std::make_unique<CenteredBinHistogram<float>>(centers,
                                                                  counts);
-  return SummaryStats::Create(static_cast<int32_t>(scalars.count), maxValue,
-                              minValue, sumValue, sumSquaresValue,
+  return SummaryStats::Create(static_cast<int32_t>(scalars.count), scalarsF.max,
+                              scalarsF.min, scalarsF.sum, scalarsF.sumSquares,
                               std::move(histogram));
 }
 
 }  // namespace internal
 
-inline Result<internal::SummaryStats> ComputeStats(const Variable<>& var) {
+inline Result<SummaryStats> ComputeStats(const Variable<>& var) {
   return internal::ComputeStatsImpl(var, {});
 }
 
-inline Result<internal::SummaryStats> ComputeStats(
+inline Result<SummaryStats> ComputeStats(
     const Variable<>& var, absl::Span<const float> binCenters) {
   return internal::ComputeStatsImpl(var, binCenters);
 }

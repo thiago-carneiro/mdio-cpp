@@ -32,6 +32,19 @@
 
 namespace {
 
+// Test stores live under a per-test directory inside gtest's temp root
+// (TEST_TMPDIR/TMPDIR, else /tmp) so a run never litters its working
+// directory and parallel runs never collide (the previous unseeded
+// std::rand() names were identical in every process).
+std::string TestStorePath(const std::string& relative) {
+  std::string path = ::testing::TempDir();
+  const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+  if (info != nullptr) {
+    path += std::string(info->test_suite_name()) + "." + info->name() + "/";
+  }
+  return path + relative;
+}
+
 // =============================================================================
 // ZarrDriver Tests
 // =============================================================================
@@ -842,8 +855,7 @@ TEST(ZarrV3, PrepareVariableAttributes_EmptyCoordinates) {
 
 TEST(ZarrV3, ReadVariableAttributes) {
   // Create a temporary directory with a zarr.json file
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                ("zarr_v3_read_attrs_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_read_attrs_");
   std::filesystem::create_directories(tmpDir);
 
   // Write a test zarr.json file
@@ -877,8 +889,7 @@ TEST(ZarrV3, ReadVariableAttributes) {
 }
 
 TEST(ZarrV3, ReadVariableAttributes_NoAttributesInFile) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                ("zarr_v3_no_attrs_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_no_attrs_");
   std::filesystem::create_directories(tmpDir);
 
   // Write zarr.json without attributes field
@@ -1149,8 +1160,7 @@ std::vector<std::string> DiscoveredVariableNames(
 }  // namespace
 
 TEST(ZarrV3, WriteMetadata_WritesVariableIndexToRoot) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_index_write_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_index_write_");
   std::filesystem::create_directories(tmpDir);
 
   nlohmann::json dataset_metadata = {{"name", "index_test"}};
@@ -1181,8 +1191,7 @@ TEST(ZarrV3, WriteMetadata_WritesVariableIndexToRoot) {
 }
 
 TEST(ZarrV3, ReadMetadata_UsesIndexAndSkipsList) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_index_open_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_index_open_");
   // "decoy" exists on disk but is not in the index: the List path would
   // discover it, so its absence from the result proves the List was skipped.
   WriteSyntheticV3Store(tmpDir, {"seismic", "inline"},
@@ -1202,8 +1211,7 @@ TEST(ZarrV3, ReadMetadata_UsesIndexAndSkipsList) {
 }
 
 TEST(ZarrV3, ReadMetadata_FallsBackToListWithoutIndex) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_no_index_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_no_index_");
   // No index (mdio-python / foreign / pre-index mdio-cpp store shape): the
   // same store now must also discover the decoy via the List path.
   WriteSyntheticV3Store(tmpDir, {}, {"seismic", "inline", "decoy"});
@@ -1220,8 +1228,7 @@ TEST(ZarrV3, ReadMetadata_FallsBackToListWithoutIndex) {
 }
 
 TEST(ZarrV3, ReadMetadata_WriteThenOpenRoundTrip) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_roundtrip_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_roundtrip_");
   std::filesystem::create_directories(tmpDir);
 
   // Create the store with the real writer (root + index)...

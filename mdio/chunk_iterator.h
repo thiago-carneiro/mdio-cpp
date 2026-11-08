@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -148,8 +149,9 @@ class ChunkRange {
    * @param chunk_shape The chunk size per dimension; every entry must be
    * positive.
    * @return An `mdio::Result` object containing the range, or
-   * InvalidArgumentError if the entries per dimension do not match or any
-   * domain/chunk size is not positive.
+   * InvalidArgumentError if the entries per dimension do not match, any
+   * domain/chunk size is not positive, or the domain extent or chunk-grid
+   * size exceeds the range the grid math can address.
    */
   static Result<ChunkRange> Create(std::vector<Index> domain_origin,
                                    std::vector<Index> domain_shape,
@@ -173,8 +175,11 @@ inline ChunkIterator::ChunkIterator(std::vector<Index> domain_origin,
   current_indices_.assign(domain_shape_.size(), 0);
   total_chunks_ = 1;
   for (std::size_t i = 0; i < domain_shape_.size(); ++i) {
-    const std::size_t chunks_in_dim = static_cast<std::size_t>(
-        (domain_shape_[i] + chunk_shape_[i] - 1) / chunk_shape_[i]);
+    // Ceil division without the overflow the (shape + chunk - 1) form risks
+    // for extreme shapes; both operands are positive (validated in Create).
+    const std::size_t chunks_in_dim =
+        static_cast<std::size_t>(domain_shape_[i] / chunk_shape_[i]) +
+        (domain_shape_[i] % chunk_shape_[i] != 0 ? 1 : 0);
     chunks_per_dimension_.push_back(chunks_in_dim);
     total_chunks_ *= chunks_in_dim;
   }
@@ -202,11 +207,15 @@ inline void ChunkIterator::SetBoxForCurrentIndices() {
   std::vector<Index> box_origin(domain_origin_.size());
   std::vector<Index> box_shape(domain_origin_.size());
   for (std::size_t i = 0; i < current_indices_.size(); ++i) {
-    const Index start =
-        domain_origin_[i] +
-        static_cast<Index>(current_indices_[i]) * chunk_shape_[i];
-    const Index stop =
-        std::min(start + chunk_shape_[i], domain_origin_[i] + domain_shape_[i]);
+    // Overflow-free clamping: for k < chunks_in_dim, k * chunk_shape stays
+    // below domain_shape, so start cannot pass the domain edge, and adding
+    // the remaining chunk size in the min keeps stop within the domain end
+    // (Create guarantees origin + shape does not overflow).
+    const Index domain_end = domain_origin_[i] + domain_shape_[i];
+    const Index start = domain_origin_[i] +
+                        static_cast<Index>(current_indices_[i]) *
+                            chunk_shape_[i];
+    const Index stop = start + std::min(chunk_shape_[i], domain_end - start);
     box_origin[i] = start;
     box_shape[i] = stop - start;
   }
@@ -234,6 +243,34 @@ inline Result<ChunkRange> ChunkRange::Create(std::vector<Index> domain_origin,
                                                      i, " is non-positive (",
                                                      chunk_shape[i], ")."));
     }
+    // The iterator computes domain_origin[i] + domain_shape[i] (the domain
+    // end) and derives boxes from it; a domain extent beyond the Index range
+    // would overflow that arithmetic.
+    if (domain_origin[i] >
+        std::numeric_limits<Index>::max() - domain_shape[i]) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Domain dimension ", i, " extent (origin ", domain_origin[i],
+          " + size ", domain_shape[i],
+          ") exceeds the index range used by the chunk grid."));
+    }
+  }
+
+  // Reject grids whose chunk count would exceed the iterator's size_t range:
+  // the per-dimension ceil division is overflow-free, but the row-major
+  // product must be checked dimension by dimension.
+  std::size_t total_chunks = 1;
+  for (std::size_t i = 0; i < rank; ++i) {
+    const std::size_t chunks_in_dim =
+        static_cast<std::size_t>(domain_shape[i] / chunk_shape[i]) +
+        (domain_shape[i] % chunk_shape[i] != 0 ? 1 : 0);
+    if (chunks_in_dim != 0 &&
+        total_chunks > std::numeric_limits<std::size_t>::max() / chunks_in_dim) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Chunk grid has too many chunks: dimension ", i, " alone needs ",
+          chunks_in_dim, " chunks and the total would exceed the addressable ",
+          "range."));
+    }
+    total_chunks *= chunks_in_dim;
   }
 
   return ChunkRange(std::move(domain_origin), std::move(domain_shape),
