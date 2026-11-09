@@ -2049,8 +2049,11 @@ class Dataset {
    * Datasets with header variables are rejected: the creation schema has no
    * representation for them, so serializing them would produce a JSON that
    * silently drops them when re-created.
-   * @param defaults Whether to include default values in the underlying
-   * spec serialization.
+   * @param defaults TensorStore option forwarded to the underlying spec
+   * serialization: with the default (`IncludeDefaults{}`) members equal to
+   * their default values are omitted from the emitted JSON, while
+   * `IncludeDefaults{true}` keeps them. Both variants pass the creation
+   * validation and are consumable by from_json().
    * @return The creation JSON on success, or an error.
    */
   Result<nlohmann::json> to_json(

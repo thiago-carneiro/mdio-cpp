@@ -20,11 +20,16 @@ The goal of this user guide is to provide an introduction on how you may want to
   - [Variable, VariableData, and Dataset](#variable-variabledata-and-dataset)
 - [Example Schema](#example-schema)
 - [Constructors](#constructors)
+  - [Round-tripping a Dataset](#round-tripping-a-dataset)
 - [Slicing](#slicing)
+  - [Iterating the chunk grid](#iterating-the-chunk-grid)
 - [Read](#read)
 - [Write](#write)
 - [Efficient Assignment (Advanced)](#efficient-assignment-advanced)
+  - [Transforming between variables](#transforming-between-variables)
 - [Mutable Metadata](#mutable-metadata)
+  - [Computing and publishing statistics](#computing-and-publishing-statistics)
+  - [Merging partial statistics](#merging-partial-statistics)
   - [Variable index semantics](#variable-index-semantics)
 
 ## Getting started
@@ -284,7 +289,7 @@ If you find a case where **MDIO** throws an exception, please submit a [bug repo
 Open options control how we interact with files, and **MDIO** is no different.
 - `mdio::constants::kOpen`: Opens an **MDIO** for reading and writing. This is only valid for existing MDIO files and will return an error status if it does not exist.
 - `mdio::constants::kCreate`: Opens a new **MDIO** for writing. This will return an error if the file already exists.
-- `mdio::constants::kCreateClean`: Opens a new **MDIO** for writing. This <b><u>will</u></b> overwrite existing metadata and stored arrays and should only be used in testing. Users are strongly encouraged to avoid including this option in any production environment as data could be lost if improperly used.
+- `mdio::constants::kCreateClean`: Opens a new **MDIO** for writing. This <b><u>will</u></b> overwrite existing metadata and stored arrays and should only be used in testing. Before anything is deleted, every variable spec is validated at the MDIO level, so an invalid spec is rejected and leaves the existing store untouched. For local-file stores on POSIX systems the teardown is fast-pathed per variable: each variable's own subtree is emptied directly (`BestEffortPreDeleteLocalStore`), while the dataset-root metadata files and unrelated sibling entries are preserved and the stock per-variable delete pass remains as the backstop. Cloud and other kvstore backends always use the stock pass. Users are strongly encouraged to avoid including this option in any production environment as data could be lost if improperly used.
 
 ### Variable, VariableData, and Dataset
 An `mdio::Variable` is the C++ representation of the [Dataset model](https://mdio-python.readthedocs.io/en/v1/data_models/version_1.html#mdio.schemas.v1.variable.Variable) Variable. It holds no array data, but will be used to both read and write. This process will be explained in more depth below.
@@ -345,7 +350,7 @@ nlohmann::json get_schema();
 int main() {
   std::string path = "demo.mdio";
   nlohmann::json schema = get_schema();
-  mdio::Future<mdio::Dataset> dsFuture = mdio::Dataset::from_json(path, schema, mdio::constants::kCreate);
+  mdio::Future<mdio::Dataset> dsFuture = mdio::Dataset::from_json(schema, path, mdio::constants::kCreate);
   if (!dsFuture.status().ok()) {
     std::cerr << "Failed to open a new dataset\n" << dsFuture.status() << std::endl;
     return 1;
@@ -371,6 +376,38 @@ int main() {
   return 0;
 }
 ```
+
+### Round-tripping a Dataset
+`Dataset::to_json()` serializes a Dataset back into the creation JSON consumed by `from_json()`, which makes structural copies of an existing store straightforward. The output carries the logical schema — variable names, data types, dimensions, chunk grids, compressors, long names, coordinates, and the stored user attributes (`statsV1`/`unitsV1`/`attributes`) — and it is validated against the dataset creation schema before being returned, so a successful result can be fed straight back into `from_json()`. It is a structure-only copy: the new store starts empty and is filled by whatever you write into it afterwards.
+```C++
+int main() {
+  mdio::Future<mdio::Dataset> dsFut = mdio::Dataset::Open("demo.mdio", mdio::constants::kOpen);
+  if (!dsFut.status().ok()) {
+    std::cerr << "Failed to open dataset: " << dsFut.status() << std::endl;
+    return 1;
+  }
+  mdio::Dataset ds = dsFut.value();
+
+  mdio::Result<nlohmann::json> jsonRes = ds.to_json();
+  if (!jsonRes.status().ok()) {
+    std::cerr << "Failed to serialize dataset: " << jsonRes.status() << std::endl;
+    return 1;
+  }
+
+  mdio::Future<mdio::Dataset> copyFut = mdio::Dataset::from_json(
+      jsonRes.value(), "copy.mdio", mdio::zarr::ZarrVersion::kV3,
+      mdio::constants::kCreateClean);
+  if (!copyFut.status().ok()) {
+    std::cerr << "Failed to create the copy: " << copyFut.status() << std::endl;
+    return 1;
+  }
+  return 0;
+}
+```
+
+Datasets with header variables are rejected: the creation schema has no representation for them, so serializing them would produce a JSON that silently drops them when re-created.
+
+The optional `defaults` argument is forwarded to the underlying TensorStore spec serialization: with the default (`mdio::IncludeDefaults{}`) members that equal their default values are omitted from the emitted JSON, and `mdio::IncludeDefaults{true}` keeps them. Both variants pass the creation validation and are consumable by `from_json()`.
 
 ## Slicing
 Slicing in **MDIO** is the concept of getting a subset of the data. This could be anything from a single point to a full [hypercube](https://en.wikipedia.org/wiki/Hypercube). Slicing is non-destructive, meaning that if you have pre-existing data that gets sliced that original data will remain untouched.
@@ -431,6 +468,32 @@ int main() {
   return 0;
 }
 ```
+
+### Iterating the chunk grid
+`Variable::chunks()` returns a range over the variable's chunk grid — one `tensorstore::Box` per chunk position. Each box carries absolute indices into the variable's index domain (`origin()` and `shape()`), and edge chunks yield partial boxes, never out-of-bounds indices. The grid is derived from the stored chunk shape, so rechunking the store changes the iteration. Traversal is row-major, but the order is not a contract.
+```C++
+mdio::Result<void> inspect_chunks(mdio::Dataset& ds) {
+  // We can use the .at method since we're not reading data from disk
+  MDIO_ASSIGN_OR_RETURN(auto gridVariable, ds.variables.at("Grid"));
+
+  MDIO_ASSIGN_OR_RETURN(auto chunks, gridVariable.chunks());
+  for (const auto& chunk : chunks) {
+    // chunk.origin() and chunk.shape() are absolute domain indices.
+    std::cout << "Chunk origin: " << chunk.origin()[0] << std::endl;
+  }
+  return absl::OkStatus();
+}
+```
+
+Two overloads restrict the grid to a subset of dimensions (given by label or zero-based index, variadic or as a vector). Every dimension left out of the subset is covered at its full extent, so each box spans one chunk position along the named dimensions and the complete extent along all the others:
+```C++
+// Full-height column tiles over the X dimension:
+MDIO_ASSIGN_OR_RETURN(auto columnChunks, gridVariable.chunks("X"));
+```
+
+The grid is anchored at the domain origin: a freshly opened variable's domain is 0-based, so the boxes coincide with the stored chunk grid, while a sliced variable's domain carries an offset and the grid tessellates over that offset domain.
+
+This is API ergonomics, not an I/O pattern: keep the read path on `variable.Read()` (or `tensorstore::Read`); do not adopt one-box-per-chunk as the default read pattern.
 
 ## Read
 Reading **MDIO** is performed lazily, which means that we will only read a small amount of metadata from disk when the **MDIO** is opened. In order to read the array data from disk, we will need to actively solicit the read. It's important to note that once we solicit the read, all of the data will be read at once in parallel automatically. If the data is sliced before reading, only the [chunk grids](https://mdio-python.readthedocs.io/en/v1/data_models/version_1.html#mdio.schemas.v1.variable.VariableMetadata.chunk_grid) contained within the slice are read.
@@ -601,52 +664,109 @@ mdio::Result<void> copy_overwrite_and_return(mdio::Dataset& ds) {
 }
 ```
 
+### Transforming between variables
+`mdio::TransformVariable(src, dst, fn)` transfers `src` into `dst` one element at a time, dtype-erased: source and destination dtypes may differ, and `fn` defines the mapping between them. The transform receives the source element and the destination element buffer as raw bytes and must report the number of bytes it wrote, which must equal the destination element size — a mismatching report fails the transfer instead of silently under- or overflowing the destination buffer. For a structured dtype opened as its void byte view the unit is the whole record; for a scalar dtype (including a field view of a structured dtype) it is one dtype item.
+```C++
+/** @brief Copies an 8-bit sample variable into a 32-bit float variable. */
+mdio::Result<void> widen_samples(mdio::Variable<>& src, mdio::Variable<>& dst) {
+  mdio::ElementTransform widen =
+      [](std::string_view srcBytes, std::string_view dstBytes)
+      -> absl::StatusOr<std::size_t> {
+    if (dstBytes.size() != sizeof(mdio::dtypes::float32_t)) {
+      return absl::InvalidArgumentError("Destination element is not float32.");
+    }
+    const auto sample = static_cast<mdio::dtypes::uint8_t>(srcBytes.front());
+    mdio::dtypes::float32_t widened = static_cast<float>(sample);
+    std::memcpy(const_cast<char*>(dstBytes.data()), &widened, sizeof(widened));
+    return sizeof(widened);
+  };
+  return mdio::TransformVariable(src, dst, widen).status();
+}
+```
+
+The whole region is transferred in one read-transform-write pass, so memory use scales with the variable's size. For a bounded-memory transfer, slice both variables and transform block by block (each block is one read-compute-write cycle):
+```C++
+mdio::Result<void> transform_in_blocks(mdio::Variable<>& src,
+                                       mdio::Variable<>& dst,
+                                       const mdio::Index blockSize,
+                                       const mdio::Index depthSize,
+                                       const mdio::ElementTransform& fn) {
+  for (mdio::Index start = 0; start < depthSize; start += blockSize) {
+    const mdio::Index stop = std::min(start + blockSize, depthSize);
+    MDIO_ASSIGN_OR_RETURN(auto srcSlice, src.slice({{"depth", start, stop}}));
+    MDIO_ASSIGN_OR_RETURN(auto dstSlice, dst.slice({{"depth", start, stop}}));
+    MDIO_RETURN_IF_ERROR(mdio::TransformVariable(srcSlice, dstSlice, fn).status());
+  }
+  return absl::OkStatus();
+}
+```
+
+The transfer is atomic with respect to the destination: if the transform returns an error or violates the byte-count contract, nothing is written and `dst` keeps its prior contents. Validation errors (rank, shape, or element count mismatch between the variables) are also raised before anything is written.
+
+The returned future composes with `ExecuteWhenReady` like any TensorStore future; observe the outcome through `status()`, which waits for completion.
+
 ## Mutable Metadata
 You may have noticed that [summary statistics](https://mdio-python.readthedocs.io/en/v1/data_models/version_1.html#mdio.schemas.v1.stats.StatisticsMetadata) is part of the dataset model, but how can you include them in your Variable before you've even seen the data? This thought exercise assumes that the answer is "You can't!". To address this problem we allow a limited portion of the metadata to be changed at the Variable level.
+
+The mutable portion is the Variable's user attributes: `statsV1`, `unitsV1`, and the free-form `attributes` object. Changes are applied in memory with `UpdateAttributes` and become durable only when the owning `Dataset` is committed with `CommitMetadata`. Free-form keys follow the same pattern: fetch the JSON with `GetAttributes()`, modify it, and pass it back to `UpdateAttributes`. If the Variable carries an int32-typed histogram, use the template `UpdateAttributes<mdio::dtypes::int32_t>` so the existing histogram re-parses with its original type (the default is float32).
+
+### Computing and publishing statistics
+Do not hand-write a `statsV1` JSON object — compute it with `mdio::ComputeStats`. It reads the Variable and produces the on-disk statsV1 contract: an int32 count, float32 sum/sumSquares/min/max, and a centered-bin histogram whose bin centers are derived from the data range. NaN values are skipped (they are missing, not values); a Variable with no data yields the canonical empty statsV1. Supported dtypes are float32, float64, and the signed/unsigned integers; anything else (e.g. float16, complex, struct arrays) is rejected.
+
+`ComputeStats` does not persist anything. Publishing goes through `UpdateAttributes` — which replaces the whole user attributes — and `CommitMetadata`:
 ```C++
-mdio::Future<void> UpdateStats(mdio::Dataset& ds) {
+mdio::Future<void> PublishGridStats(mdio::Dataset& ds) {
   // We can use the .at method since we're not reading data from disk
   MDIO_ASSIGN_OR_RETURN(auto gridVariable, ds.variables.at("Grid"));
-  MDIO_ASSIGN_OR_RETURN(auto xVariable, ds.variables.at("X"));
-  MDIO_ASSIGN_OR_RETURN(auto yVariable, ds.variables.at("Y"));
 
-  // Get the attributes JSON
+  MDIO_ASSIGN_OR_RETURN(auto stats, mdio::ComputeStats(gridVariable));
+
+  // UpdateAttributes replaces the WHOLE user attributes, so start from
+  // GetAttributes() to preserve any existing attributes/units.
   nlohmann::json gridAttrs = gridVariable.GetAttributes();
-  nlohmann::json xAttrs = xVariable.GetAttributes();
-  nlohmann::json yAttrs = yVariable.GetAttributes();
-
-  // Modify the attributes in memory
-  xAttrs["attributes"]["foo"] = "bar";
-  yAttrs["attributes"]["ping"] = "pong";
-  // We had no stats in the original object, so we must populate all the required fields!
-  gridAttrs["statsV1"]["histogram"]["binCenters"] = {5, 15, 25, 35, 45};
-  gridAttrs["statsV1"]["histogram"]["counts"] = {1, 2, 3, 4, 5};
-  gridAttrs["statsV1"]["count"] = 51200;
-  gridAttrs["statsV1"]["min"] = 0.0;
-  gridAttrs["statsV1"]["max"] = 50.0;
-  gridAttrs["statsV1"]["sum"] = 52.7;
-  gridAttrs["statsV1"]["sumSquares"] = 2777.29;
-  gridAttrs["attributes"]["randomStats"] = true;
-
-  // Update the attributes in memory associated with their Variable
-  auto xUpdateRes = xVariable.UpdateAttributes(xAttrs);
-  if (!xUpdateRes.status().ok()) {
-    return xUpdateRes.status();
-  }
-  auto yUpdateRes = yVariable.UpdateAttributes(yAttrs);
-  if (!yUpdateRes.status().ok()) {
-    return yUpdateRes.status();
-  }
-  // Since we are using an integer historgram we need to specify the type. It can be float32 or int32.
-  auto gridUpdateRes = gridVariable.UpdateAttributes<mdio::dtypes::int32_t>(gridAttrs);
-  if (!gridUpdateRes.status().ok()) {
-    return gridUpdateRes.status();
-  }
+  gridAttrs["statsV1"] = stats.getBindable();
+  MDIO_RETURN_IF_ERROR(gridVariable.UpdateAttributes(gridAttrs));
 
   // The commit step will commit the changes in memory to disk
   return ds.CommitMetadata();
 }
 ```
+
+Caveat (measured downstream): for some store layouts this full round-trip nests the `attributes` key one level deeper per commit. For such layouts use the narrow form `gridVariable.UpdateAttributes({{"statsV1", stats.getBindable()}})` — it avoids the nesting but still replaces the whole user attributes, so include `unitsV1` and `attributes` alongside when they must survive.
+
+### Merging partial statistics
+For a Variable too large to read in one pass, or a computation split across workers, compute one partial per disjoint subset and combine them with `mdio::MergeStats`: counts and sums add up, min/max fold, and histograms merge by summing per-bin counts — in any order. Partials with a count of zero are neutral and contribute nothing; if every partial is neutral, the result is the canonical empty statsV1.
+
+Partials computed over their own sub-ranges would each derive different bin centers, so compute every partial with the same explicit bin centers using the two-argument `ComputeStats` overload. Values are assigned to the nearest bin center; a value exactly between two centers goes to the higher one, and values outside the center range are clamped to the first/last bin:
+```C++
+mdio::Future<void> PublishGridStatsPartitioned(mdio::Dataset& ds) {
+  // We can use the .at method since we're not reading data from disk
+  MDIO_ASSIGN_OR_RETURN(auto gridVariable, ds.variables.at("Grid"));
+
+  // Every partial must share one histogram: fix the bin centers up front.
+  const std::vector<float> binCenters = {5.f, 15.f, 25.f, 35.f, 45.f};
+
+  // One partial per disjoint slice of the Variable. Chunk-aligned
+  // partitions work the same way (see "Iterating the chunk grid").
+  MDIO_ASSIGN_OR_RETURN(auto upperHalf, gridVariable.slice({{"Y", 0, 25600}}));
+  MDIO_ASSIGN_OR_RETURN(auto lowerHalf,
+                        gridVariable.slice({{"Y", 25600, 51200}}));
+  std::vector<mdio::SummaryStats> partials;
+  for (const auto& part : {upperHalf, lowerHalf}) {
+    MDIO_ASSIGN_OR_RETURN(auto stats, mdio::ComputeStats(part, binCenters));
+    partials.push_back(std::move(stats));
+  }
+
+  MDIO_ASSIGN_OR_RETURN(auto merged, mdio::MergeStats(partials));
+
+  nlohmann::json gridAttrs = gridVariable.GetAttributes();
+  gridAttrs["statsV1"] = merged.getBindable();
+  MDIO_RETURN_IF_ERROR(gridVariable.UpdateAttributes(gridAttrs));
+  return ds.CommitMetadata();
+}
+```
+
+**Histogram binnings.** A statsV1 histogram is either *centered* — `binCenters` plus per-bin `counts` (`mdio::CenteredBinHistogram`) — or *edge-defined* — `binEdges`, `binWidths`, and `counts` (`mdio::EdgeDefinedHistogram`). `ComputeStats` always produces a centered histogram; edge-defined histograms arrive from persisted statsV1 JSON. `MergeStats` accepts either, but every partial that carries data must either carry no histogram at all (the empty binning of the mdio-python import convention) or carry a histogram with exactly the same binning: identical bin centers for centered histograms, identical bin edges and widths for edge-defined ones. Mixing a histogram-carrying partial with an empty-binning one, or supplying incompatible edge-defined specs (different edges or widths), is rejected with an error — partials cannot be rebinned from counts alone.
 
 ### Variable index semantics
 Zarr v3 stores written by MDIO keep a variable index in the root metadata (the `_mdio_variable_index` attribute) so `Open` can resolve variables without listing the whole store. The index is authoritative: an open of an indexed store sees exactly the variables it lists. Variables added by other tooling (outside MDIO) are invisible to it, and `CommitMetadata` regenerates the index from the variables the `Dataset` holds — excluding them — so a metadata commit on such a store perpetuates the gap. If you add variables externally, remove the `_mdio_variable_index` attribute from the root `zarr.json` before the next open: without an index, `Open` falls back to listing the store and sees every variable.
