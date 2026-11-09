@@ -64,6 +64,14 @@ if(NOT TARGET EXT_ABSL::log)
   if(TARGET absl::log)
     set_target_properties(EXT_ABSL::log PROPERTIES
       INTERFACE_LINK_LIBRARIES absl::log)
+  else()
+    # Without this a missing absl::log produced an empty imported target and
+    # the failure surfaced only as undefined ABSL_LOG symbols at link time.
+    message(FATAL_ERROR
+      "absl::log target not found; EXT_ABSL::log would be an empty imported "
+      "target. mdio's public headers use ABSL_LOG, so the Abseil log library "
+      "built alongside tensorstore must be available -- ensure the "
+      "EXT_TENSORSTORE dependency is found before configuring mdio.")
   endif()
 endif()
 target_link_libraries(mdio INTERFACE

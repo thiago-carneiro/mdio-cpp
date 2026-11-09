@@ -17,7 +17,6 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -1090,8 +1089,8 @@ TEST(ZarrV3, ExtractVariableIndex_MissingKeyFallsBack) {
 }
 
 TEST(ZarrV3, ExtractVariableIndex_NoAttributesFallsBack) {
-  auto root = nlohmann::json::parse(
-      R"({"zarr_format": 3, "node_type": "group"})");
+  auto root =
+      nlohmann::json::parse(R"({"zarr_format": 3, "node_type": "group"})");
 
   EXPECT_TRUE(mdio::zarr::v3::ExtractVariableIndex(root).empty());
 }
@@ -1170,8 +1169,7 @@ std::vector<std::string> DiscoveredVariableNames(
   for (const auto& spec : specs) {
     std::string path = spec["kvstore"]["path"].get<std::string>();
     size_t slash = path.find_last_of('/');
-    names.push_back(slash == std::string::npos ? path
-                                               : path.substr(slash + 1));
+    names.push_back(slash == std::string::npos ? path : path.substr(slash + 1));
   }
   return names;
 }
@@ -1250,8 +1248,7 @@ TEST(ZarrV3, ReadMetadata_FallsBackToListWithoutIndex) {
 // variable whose metadata is missing fails the open naming the variable,
 // instead of silently opening an incomplete dataset.
 TEST(ZarrV3, ReadMetadata_IndexedVariableMissingFails) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_index_missing_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_index_missing_");
   // The index lists "missing", but only "seismic" exists on disk.
   WriteSyntheticV3Store(tmpDir, {"seismic", "missing"}, {"seismic"});
 
@@ -1267,10 +1264,8 @@ TEST(ZarrV3, ReadMetadata_IndexedVariableMissingFails) {
 // Corrupt (unparseable) metadata for an indexed variable fails the open
 // the same way a missing one does.
 TEST(ZarrV3, ReadMetadata_IndexedVariableCorruptFails) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_index_corrupt_" + std::to_string(std::rand()));
-  WriteSyntheticV3Store(tmpDir, {"seismic", "corrupt"},
-                        {"seismic", "corrupt"});
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_index_corrupt_");
+  WriteSyntheticV3Store(tmpDir, {"seismic", "corrupt"}, {"seismic", "corrupt"});
   {
     std::ofstream corrupt_file(tmpDir / "corrupt" / "zarr.json");
     corrupt_file << "{ not json";
@@ -1290,8 +1285,7 @@ TEST(ZarrV3, ReadMetadata_IndexedVariableCorruptFails) {
 // also fails the open. The List path keeps skipping groups leniently (see
 // ReadMetadata_FallsBackToListWithoutIndex).
 TEST(ZarrV3, ReadMetadata_IndexedNonArrayFails) {
-  auto tmpDir = std::filesystem::temp_directory_path() /
-                 ("zarr_v3_index_group_" + std::to_string(std::rand()));
+  std::filesystem::path tmpDir = TestStorePath("zarr_v3_index_group_");
   WriteSyntheticV3Store(tmpDir, {"seismic", "groupchild"},
                         {"seismic", "groupchild"});
   {
