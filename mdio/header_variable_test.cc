@@ -246,6 +246,32 @@ class DatasetMetadataOnlyOpenTest
     WriteJsonFile(zmetadata_path, zmetadata);
   }
 
+  // mdio-cpp V3 create records the committed variable set in the root
+  // zarr.json attributes ("_mdio_variable_index") and open trusts it instead
+  // of listing the store. The discovery contract tested here targets stores
+  // WITHOUT that index -- mdio-python, foreign writers, pre-index mdio-cpp --
+  // where open must find arrays the writer did not commit. Strip the index so
+  // the test exercises the List-discovery path.
+  void StripVariableIndexIfPresent() {
+    if (version_ != mdio::zarr::ZarrVersion::kV3) {
+      return;  // V2 discovery reads .zmetadata; there is no variable index.
+    }
+    const std::string root_path = base_path_ + "/zarr.json";
+    nlohmann::json root;
+    {
+      std::ifstream in(root_path);
+      if (!in.good()) {
+        ADD_FAILURE() << "root zarr.json missing at " << root_path;
+        return;
+      }
+      in >> root;
+    }
+    if (root.contains("attributes")) {
+      root["attributes"].erase("_mdio_variable_index");
+    }
+    WriteJsonFile(root_path, root);
+  }
+
   mdio::zarr::ZarrVersion version_;
   std::string base_path_;
 };
@@ -257,6 +283,7 @@ TEST_P(DatasetMetadataOnlyOpenTest, OpenKeepsUnsupportedVariableAsMetadata) {
   ASSERT_TRUE(created.status().ok()) << created.status();
 
   InjectUnsupportedVariable();
+  StripVariableIndexIfPresent();
 
   auto opened = mdio::Dataset::Open(base_path_, mdio::constants::kOpen);
   ASSERT_TRUE(opened.status().ok()) << opened.status();
@@ -296,6 +323,33 @@ TEST_P(DatasetMetadataOnlyOpenTest, OpenKeepsUnsupportedVariableAsMetadata) {
   ASSERT_TRUE(reopened_header.status().ok()) << reopened_header.status();
   EXPECT_EQ(reopened_header.value().GetAttributes()["attributes"]["testMarker"],
             "cpp-mdio");
+}
+
+// On mdio-written stores the V3 variable index is authoritative for open:
+// open reads the index and skips the store List, so a variable written after
+// create, outside the index, is not discovered. That is the point of the
+// index (one read instead of a full-store List); open must succeed with the
+// committed variables intact.
+TEST_P(DatasetMetadataOnlyOpenTest, OpenTrustsVariableIndexOverPostCreateWrites) {
+  if (version_ != mdio::zarr::ZarrVersion::kV3) {
+    GTEST_SKIP() << "The variable index is a V3 create-time feature.";
+  }
+  auto schema = SimpleSchema();
+  auto created = mdio::Dataset::from_json(schema, base_path_, version_,
+                                          mdio::constants::kCreateClean);
+  ASSERT_TRUE(created.status().ok()) << created.status();
+
+  InjectUnsupportedVariable();  // out-of-band write; not added to the index
+
+  auto opened = mdio::Dataset::Open(base_path_, mdio::constants::kOpen);
+  ASSERT_TRUE(opened.status().ok()) << opened.status();
+  auto dataset = opened.value();
+
+  EXPECT_TRUE(dataset.variables.contains_key("data"));
+  EXPECT_FALSE(dataset.variables.contains_key(kHeaderName));
+  EXPECT_FALSE(dataset.header_variables.contains_key(kHeaderName))
+      << "Post-create out-of-band variables must not be discovered on the "
+         "index path (the index is authoritative for mdio-written stores).";
 }
 
 INSTANTIATE_TEST_SUITE_P(
