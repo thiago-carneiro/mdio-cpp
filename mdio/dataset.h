@@ -16,9 +16,11 @@
 
 #define MDIO_API_VERSION "1.0.0"
 
+#if !defined(_WIN32)
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -217,6 +219,7 @@ inline void WarnOnMissingDatasetMetadata(const ::nlohmann::json& metadata,
          "not affect how the dataset is read.";
 }
 
+#if !defined(_WIN32)
 /**
  * @brief Single-pass depth-first removal of a directory subtree, relative
  * to an open parent directory.
@@ -227,6 +230,9 @@ inline void WarnOnMissingDatasetMetadata(const ::nlohmann::json& metadata,
  * avoids both tensorstore's per-file ENOTDIR probe openat and
  * libstdc++'s remove_all second pass (which re-opens and re-enumerates
  * every directory before removing it).
+ *
+ * The named directory itself is kept: callers remove it with an explicit
+ * unlinkat when they want it gone.
  *
  * Best effort: entries that cannot be removed are left in place; the
  * stock per-variable DeleteRange that follows remains the backstop.
@@ -285,31 +291,41 @@ inline bool SinglePassRemoveTree(int parent_fd, const char* name) {
 }
 
 /**
- * @brief Best-effort fast teardown of a local store before a kCreateClean
- * open.
+ * @brief Best-effort fast teardown of the variable subtrees a kCreateClean
+ * open is about to replace.
  *
  * tensorstore's `delete_existing` pass deletes a file-kvstore range by
  * walking it with one `openat(O_DIRECTORY)` per entry: every chunk file
  * costs one failed (ENOTDIR) openat plus its unlinkat, and on NFS that
  * probe dominated the recreate wall time (measured: ~8.1k openat for a
- * 6.1k-file store, recreate ~13x a fresh create). This helper removes
- * the store contents first with SinglePassRemoveTree, which trusts
- * readdir d_type and enumerates each directory exactly once, so the
- * subsequent stock DeleteRange finds nothing left to walk.
+ * 6.1k-file store, recreate ~13x a fresh create). This helper empties
+ * each variable's own kvstore subtree first with SinglePassRemoveTree,
+ * which trusts readdir d_type and enumerates each directory exactly
+ * once, so the subsequent stock DeleteRange finds nothing left to walk.
  *
- * The store root directory itself is kept so the observable semantics
- * match the stock pass (root inode stays valid, symlinked and
- * non-directory roots behave the same); anything the fast pass could not
- * remove is still handled by the stock per-variable DeleteRange that
- * follows, which therefore remains the semantic backstop.
+ * The deletion scope mirrors the stock pass, which deletes each in-spec
+ * variable's subtree contents and nothing else: the variable directory
+ * itself is kept (its inode stays valid, matching stock), and entries
+ * under the common parent that are not an in-spec variable's own
+ * subtree -- unrelated sibling directories, loose files -- are never
+ * touched. The dataset-root metadata files the create flow rewrites
+ * (.zmetadata/.zgroup/.zattrs for V2, zarr.json for V3) are removed up
+ * front as well, version-gated to the set the writer for this spec
+ * produces; the stock flow only ever overwrites them.
  *
- * Applies only when every variable spec is a local-file kvstore sharing
- * one parent directory; anything else (cloud stores, unexpected layout)
- * keeps the stock behavior untouched.
+ * Anything the fast pass could not remove is still handled by the stock
+ * per-variable DeleteRange that follows, which therefore remains the
+ * semantic backstop. Symlinked variable directories are not followed
+ * (O_NOFOLLOW) and are left for the stock path.
+ *
+ * Applies only when every variable spec is a local-file kvstore whose
+ * paths share one parent directory; anything else (cloud stores,
+ * unexpected layout) keeps the stock behavior untouched.
  */
 inline void BestEffortPreDeleteLocalStore(
     const std::vector<::nlohmann::json>& json_variables) {
   std::optional<std::string> store_root;
+  std::vector<std::string> variable_names;
   for (const auto& json : json_variables) {
     if (!json.contains("kvstore")) {
       return;
@@ -320,9 +336,21 @@ inline void BestEffortPreDeleteLocalStore(
         kvstore["driver"].get<std::string>() != "file") {
       return;  // Cloud or malformed spec: keep the stock delete path.
     }
-    std::filesystem::path var_path(kvstore["path"].get<std::string>());
-    std::string parent = var_path.parent_path().string();
-    if (parent.empty()) {
+    std::string path_text = kvstore["path"].get<std::string>();
+    // A trailing slash would make filename() empty and parent_path()
+    // resolve to the variable directory itself; strip it first.
+    while (!path_text.empty() && path_text.back() == '/') {
+      path_text.pop_back();
+    }
+    if (path_text.empty()) {
+      return;  // Unexpected layout; keep the stock delete path.
+    }
+    const std::filesystem::path var_path(path_text);
+    const std::string name = var_path.filename().string();
+    const std::string parent = var_path.parent_path().string();
+    // "." and ".." must never be treated as a variable directory: removing
+    // one would walk outside the store.
+    if (name.empty() || name == "." || name == ".." || parent.empty()) {
       return;  // Unexpected layout; keep the stock delete path.
     }
     if (!store_root) {
@@ -330,13 +358,11 @@ inline void BestEffortPreDeleteLocalStore(
     } else if (*store_root != parent) {
       return;  // Variables disagree on the dataset root; keep stock path.
     }
+    variable_names.push_back(name);
   }
-  if (!store_root) {
+  if (!store_root || variable_names.empty()) {
     return;
   }
-  // Remove the children of the root, keeping the root directory itself
-  // (matching the stock DeleteRange, which never deletes the kvstore
-  // root, only its contents).
   int root_fd = ::open(store_root->c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (root_fd < 0) {
     return;  // Root missing: nothing to delete; stock path preserves
@@ -347,30 +373,30 @@ inline void BestEffortPreDeleteLocalStore(
     ::close(root_fd);
     return;
   }
-  while (true) {
-    errno = 0;
-    struct ::dirent* entry = ::readdir(root_dir);
-    if (entry == nullptr) {
-      break;  // Errors inside SinglePassRemoveTree stay best-effort.
-    }
-    if (::strcmp(entry->d_name, ".") == 0 ||
-        ::strcmp(entry->d_name, "..") == 0) {
-      continue;
-    }
-    if (entry->d_type == DT_DIR) {
-      SinglePassRemoveTree(root_fd, entry->d_name);
-      ::unlinkat(root_fd, entry->d_name, AT_REMOVEDIR);
-    } else if (entry->d_type == DT_UNKNOWN) {
-      if (::unlinkat(root_fd, entry->d_name, 0) != 0 && errno == EISDIR) {
-        SinglePassRemoveTree(root_fd, entry->d_name);
-        ::unlinkat(root_fd, entry->d_name, AT_REMOVEDIR);
-      }
-    } else {
-      ::unlinkat(root_fd, entry->d_name, 0);
+  // Empty each in-spec variable's own subtree, keeping the variable
+  // directory itself (matching the stock per-variable DeleteRange, which
+  // never deletes the kvstore directory, only its contents). Unrelated
+  // entries under the root are left untouched.
+  for (const auto& name : variable_names) {
+    SinglePassRemoveTree(root_fd, name.c_str());
+  }
+  // Remove the dataset-root metadata files the create flow rewrites,
+  // restricted to the set the writer for this spec's version produces
+  // (the stock flow only ever overwrites them). Best effort: a missing
+  // file is fine.
+  if (!json_variables.empty() &&
+      zarr::GetVersionFromSpec(json_variables[0]) == zarr::ZarrVersion::kV3) {
+    ::unlinkat(root_fd, "zarr.json", 0);
+  } else {
+    static constexpr std::array<const char*, 3> kV2RootMetadata = {
+        ".zmetadata", ".zgroup", ".zattrs"};
+    for (const char* metadata_name : kV2RootMetadata) {
+      ::unlinkat(root_fd, metadata_name, 0);
     }
   }
   ::closedir(root_dir);
 }
+#endif  // !defined(_WIN32)
 
 // ==========================================================================
 // Creation-JSON serialization helpers (Dataset::to_json)
@@ -1280,6 +1306,16 @@ class Dataset {
     // resolve bounds onto the NaN position, silently mis-anchoring the
     // selection. A NaN-containing axis is corrupt; error loudly instead.
     if constexpr (std::is_floating_point_v<ValueType>) {
+      // A NaN bound never compares true against any coordinate, so the
+      // endpoint searches silently anchor the range at the axis ends
+      // (lower_bound on NaN returns begin, upper_bound returns end) and
+      // the selection covers the whole axis. Reject the bound itself,
+      // even on a clean axis.
+      if (std::isnan(descriptor.start) || std::isnan(descriptor.stop)) {
+        return absl::InvalidArgumentError("Coordinate axis '" +
+                                          std::string(label) +
+                                          "': range bounds must not be NaN.");
+      }
       if (std::any_of(coords.begin(), coords.end(), [](const ValueType value) {
             return std::isnan(value);
           })) {
@@ -1697,13 +1733,33 @@ class Dataset {
         tensorstore::internal::SetAll(transact_options, options...));
     bool do_create = transact_options.open_mode == constants::kCreateClean ||
                      transact_options.open_mode == constants::kCreate;
+#if !defined(_WIN32)
     if (transact_options.open_mode == constants::kCreateClean &&
         transact_options.transaction == tensorstore::no_transaction) {
+      // Gate the fast teardown on the mdio-level validation each
+      // per-variable Open applies (HeaderVariable::FromSpec for header
+      // specs, ValidateAndProcessJson for normal specs): stock deletes
+      // existing data only after that validation passes, so a spec
+      // rejected at the mdio level must leave the old store untouched.
+      // Run the same validation here, before the pre-delete; a create
+      // that fails after this point still destroys the old store,
+      // matching the stock failure window (see
+      // BestEffortPreDeleteLocalStore documentation).
+      for (const auto& json : json_variables) {
+        if (internal::IsHeaderOnlySpec(json)) {
+          TENSORSTORE_RETURN_IF_ERROR(
+              HeaderVariable<>::FromSpec(json).status());
+        } else {
+          TENSORSTORE_RETURN_IF_ERROR(
+              internal::ValidateAndProcessJson(json).status());
+        }
+      }
       // Fast-path the `delete_existing` teardown for local stores; the
       // stock per-variable DeleteRange below stays as the backstop (see
       // BestEffortPreDeleteLocalStore documentation).
       internal::BestEffortPreDeleteLocalStore(json_variables);
     }
+#endif  // !defined(_WIN32)
 
     // Extract context from options for metadata writing
     tensorstore::Context context = transact_options.context;
@@ -1767,6 +1823,18 @@ class Dataset {
          context](tensorstore::ReadyFuture<void> readyFut) {
           if (metadata.contains("api_version") &&
               !metadata.contains("apiVersion")) {
+            // The v0 marker must be a string; a corrupt store can carry
+            // any JSON type there, and get<std::string>() on one aborts
+            // the process instead of reporting the v0 model error this
+            // branch exists to produce.
+            if (!metadata["api_version"].is_string()) {
+              promise.SetResult(
+                  absl::Status(absl::StatusCode::kInvalidArgument,
+                               "Detected MDIO v0 dataset model with a "
+                               "non-string api_version field but expected "
+                               "v1"));
+              return;
+            }
             promise.SetResult(
                 absl::Status(absl::StatusCode::kInvalidArgument,
                              "Detected MDIO v0 dataset model " +
@@ -2039,9 +2107,13 @@ class Dataset {
       json["metadata"].erase("order");
       json["metadata"].erase("zarr_format");
       // On local file systems there is a trailing slash that needs to be
-      // removed.
+      // removed. Only strip it when present: a path that arrives without
+      // one (other drivers, other platforms) must not lose its last
+      // character.
       std::string path = json["kvstore"]["path"].get<std::string>();
-      path.pop_back();
+      if (!path.empty() && path.back() == '/') {
+        path.pop_back();
+      }
       json["kvstore"]["path"] = path;
       nlohmann::json meta = var->getMetadata();
       if (meta.contains("coordinates")) {
