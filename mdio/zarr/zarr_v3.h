@@ -241,8 +241,7 @@ inline std::vector<std::string> ExtractVariableNames(
     const std::vector<nlohmann::json>& json_variables) {
   std::vector<std::string> names;
   for (const auto& json : json_variables) {
-    if (!json.contains("kvstore") ||
-        !json["kvstore"].contains("path") ||
+    if (!json.contains("kvstore") || !json["kvstore"].contains("path") ||
         !json["kvstore"]["path"].is_string()) {
       continue;
     }
@@ -470,16 +469,34 @@ inline Future<void> WriteMetadata(
     const ::nlohmann::json& dataset_metadata,
     const std::vector<::nlohmann::json>& json_variables,
     tensorstore::Context context = tensorstore::Context::Default()) {
+  if (json_variables.empty()) {
+    return absl::InvalidArgumentError(
+        "Cannot write Zarr V3 metadata: the variable list is empty.");
+  }
+  // The writer derives the dataset root from the first variable's
+  // kvstore, so that spec must be well-formed; indexing or calling
+  // get<std::string>() on a malformed one is undefined behavior or an
+  // uncaught exception rather than an error result.
+  const ::nlohmann::json& first_variable = json_variables[0];
+  if (!first_variable.contains("kvstore") ||
+      !first_variable["kvstore"].is_object() ||
+      !first_variable["kvstore"].contains("driver") ||
+      !first_variable["kvstore"]["driver"].is_string() ||
+      !first_variable["kvstore"].contains("path") ||
+      !first_variable["kvstore"]["path"].is_string()) {
+    return absl::InvalidArgumentError(
+        "Cannot write Zarr V3 metadata: the first variable spec (index 0) "
+        "is missing a string kvstore driver/path.");
+  }
   // Determine the base path and driver
-  std::string driver =
-      json_variables[0]["kvstore"]["driver"].get<std::string>();
+  std::string driver = first_variable["kvstore"]["driver"].get<std::string>();
 
-  std::vector<std::string> file_parts = absl::StrSplit(
-      json_variables[0]["kvstore"]["path"].get<std::string>(), '/');
+  std::vector<std::string> file_parts =
+      absl::StrSplit(first_variable["kvstore"]["path"].get<std::string>(), '/');
   size_t toRemove = file_parts.back().size();
   std::string basePath =
-      json_variables[0]["kvstore"]["path"].get<std::string>().substr(
-          0, json_variables[0]["kvstore"]["path"].get<std::string>().size() -
+      first_variable["kvstore"]["path"].get<std::string>().substr(
+          0, first_variable["kvstore"]["path"].get<std::string>().size() -
                  toRemove - 1);
   // Ensure basePath has trailing slash for directory operations
   if (!basePath.empty() && basePath.back() != '/') {
@@ -605,8 +622,8 @@ struct V3MetadataState {
                                     const std::string& reason) const {
     return absl::InvalidArgumentError(
         "Variable '" + var_name +
-        "' is listed in the variable index but its metadata " + reason +
-        ": " + location.path + var_name + "/zarr.json");
+        "' is listed in the variable index but its metadata " + reason + ": " +
+        location.path + var_name + "/zarr.json");
   }
 
   /// Filters read results to build variable specs for arrays only.
@@ -625,10 +642,9 @@ struct V3MetadataState {
       if (!result.ok() || !result->has_value()) {
         if (is_index_path) {
           const std::string reason =
-              result.ok()
-                  ? "was not found"
-                  : "could not be read: " +
-                        std::string(result.status().message());
+              result.ok() ? "was not found"
+                          : "could not be read: " +
+                                std::string(result.status().message());
           return IndexedVariableError(candidates[i], reason);
         }
         continue;

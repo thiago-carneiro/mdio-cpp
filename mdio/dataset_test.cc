@@ -568,8 +568,8 @@ mdio::Result<mdio::Dataset> makeNaNAxisPopulated(const std::string& path) {
                         ds.variables.get<mdio::dtypes::float32_t>("data"));
   MDIO_ASSIGN_OR_RETURN(auto inlineVar,
                         ds.variables.get<mdio::dtypes::float32_t>("inline"));
-  MDIO_ASSIGN_OR_RETURN(
-      auto crosslineVar, ds.variables.get<mdio::dtypes::float32_t>("crossline"));
+  MDIO_ASSIGN_OR_RETURN(auto crosslineVar,
+                        ds.variables.get<mdio::dtypes::float32_t>("crossline"));
   MDIO_ASSIGN_OR_RETURN(auto depthVar,
                         ds.variables.get<mdio::dtypes::float32_t>("depth"));
 
@@ -609,8 +609,7 @@ mdio::Result<mdio::Dataset> makeNaNAxisPopulated(const std::string& path) {
     for (int j = 0; j < 4; ++j) {
       for (int k = 0; k < 2; ++k) {
         dataAccessor({i, j, k}) =
-            inlineCoords[i] + crosslineCoords[j] * 0.1f +
-            static_cast<float>(k);
+            inlineCoords[i] + crosslineCoords[j] * 0.1f + static_cast<float>(k);
       }
     }
   }
@@ -669,9 +668,10 @@ TEST(DatasetSpec, valid) {
 TEST(Dataset, isel) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean)
-                     .result();
+  auto dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean)
+          .result();
 
   ASSERT_TRUE(dataset.ok());
 
@@ -1406,6 +1406,42 @@ TEST(Dataset, selRangeNaNAxisErrors) {
   EXPECT_THAT(depthValues, testing::ElementsAre(testing::FloatEq(10.0f)));
 }
 
+// A NaN range BOUND on a clean monotonic floating-point axis must fail the
+// selection: comparisons against NaN are always false, so without the guard
+// lower_bound anchors a NaN start at the first element and upper_bound lets
+// a NaN stop run to the last one -- the range silently covers the axis.
+TEST(Dataset, selRangeNaNStartBoundErrors) {
+  std::string path = TestStorePath("zarrs/nanSelTester.mdio");
+  auto dsRes = makeNaNAxisPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // depth = [10, 20] is clean; {NaN, 3.5} must error, not anchor at 10.
+  const float nanValue = std::numeric_limits<float>::quiet_NaN();
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> nanStartRange = {
+      "depth", nanValue, 15.0f, 1};
+  auto startRes = ds.sel(nanStartRange);
+  ASSERT_FALSE(startRes.status().ok())
+      << "A NaN start bound must error on a clean monotonic axis";
+  EXPECT_THAT(startRes.status().message(), testing::HasSubstr("NaN"));
+}
+
+TEST(Dataset, selRangeNaNStopBoundErrors) {
+  std::string path = TestStorePath("zarrs/nanSelTester.mdio");
+  auto dsRes = makeNaNAxisPopulated(path);
+  ASSERT_TRUE(dsRes.ok()) << dsRes.status();
+  auto ds = dsRes.value();
+
+  // depth = [10, 20] is clean; {3.0, NaN} must error, not run to 20.
+  const float nanValue = std::numeric_limits<float>::quiet_NaN();
+  mdio::RangeDescriptor<mdio::dtypes::float32_t> nanStopRange = {"depth", 12.0f,
+                                                                 nanValue, 1};
+  auto stopRes = ds.sel(nanStopRange);
+  ASSERT_FALSE(stopRes.status().ok())
+      << "A NaN stop bound must error on a clean monotonic axis";
+  EXPECT_THAT(stopRes.status().message(), testing::HasSubstr("NaN"));
+}
+
 // Unordered axes (the selTester inline axis repeats values) keep requiring
 // exact, unique endpoints; the selection is positional between them.
 // mdio-python returns [2, 3, 4, 3, 5] for the same slice on this store.
@@ -1428,8 +1464,9 @@ TEST(Dataset, selRangeUnorderedExactEndpoints) {
 TEST(Dataset, selectField) {
   auto json_var = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean);
+  auto dataset =
+      mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   auto ds = dataset.value();
@@ -1478,8 +1515,9 @@ TEST(Dataset, selectField) {
 TEST(Dataset, selectFieldName) {
   auto json_var = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean);
+  auto dataset =
+      mdio::Dataset::from_json(json_var, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   auto ds = dataset.value();
@@ -1494,9 +1532,10 @@ TEST(Dataset, selectFieldName) {
 TEST(Dataset, fromConsolidatedMeta) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean)
-                     .result();
+  auto dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean)
+          .result();
 
   ASSERT_TRUE(dataset.ok());
 
@@ -1510,7 +1549,8 @@ TEST(Dataset, fromConsolidatedMeta) {
 TEST(Dataset, open) {
   auto json_schema = GetToyExample();
 
-  auto validated_schema = Construct(json_schema, TestStorePath("zarrs/acceptance"));
+  auto validated_schema =
+      Construct(json_schema, TestStorePath("zarrs/acceptance"));
 
   ASSERT_TRUE(validated_schema.ok());
 
@@ -1535,7 +1575,8 @@ TEST(Dataset, openWithContext) {
 
   auto json_schema = GetToyExample();
 
-  auto validated_schema = Construct(json_schema, TestStorePath("zarrs/acceptance"));
+  auto validated_schema =
+      Construct(json_schema, TestStorePath("zarrs/acceptance"));
 
   ASSERT_TRUE(validated_schema.ok());
 
@@ -1551,9 +1592,10 @@ TEST(Dataset, openWithContext) {
 TEST(Dataset, fromJson) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean)
-                     .result();
+  auto dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean)
+          .result();
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
 }
@@ -1603,8 +1645,9 @@ TEST(Dataset, multiFuture) {
 TEST(Dataset, coordinates) {
   auto json_vars = GetToyExample();
 
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean);
+  auto dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   EXPECT_TRUE(dataset.value().coordinates.size() > 0)
@@ -1620,8 +1663,9 @@ TEST(Dataset, coordinates) {
 TEST(Dataset, noIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetFut =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
   auto dataset = datasetFut.value();
@@ -1638,8 +1682,9 @@ TEST(Dataset, noIntervals) {
 TEST(Dataset, oneInterval) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetFut =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
   auto dataset = datasetFut.value();
@@ -1653,8 +1698,9 @@ TEST(Dataset, oneInterval) {
 TEST(Dataset, mixedIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetFut =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
   auto dataset = datasetFut.value();
@@ -1669,8 +1715,9 @@ TEST(Dataset, mixedIntervals) {
 TEST(Dataset, wrongIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetFut =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
   auto dataset = datasetFut.value();
@@ -1682,8 +1729,9 @@ TEST(Dataset, wrongIntervals) {
 TEST(Dataset, slicedIntervals) {
   auto json_vars = GetToyExample();
 
-  auto datasetFut = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetFut =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetFut.status().ok()) << datasetFut.status();
   auto dataset = datasetFut.value();
@@ -1715,13 +1763,14 @@ TEST(Dataset, create) {
 
   // Create with no pre-existing Dataset
   auto json_vars = GetToyExample();
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreate);
+  auto dataset = mdio::Dataset::from_json(
+      json_vars, TestStorePath("zarrs/acceptance"), mdio::constants::kCreate);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
 
   // Create with pre-existing Dataset
-  dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                     mdio::constants::kCreateClean);
+  dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
 
   // Simulate trying to create the same dataset but with slightly different
@@ -1780,8 +1829,9 @@ TEST(Dataset, commitMetadata) {
   std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
   auto dataset = datasetRes.value();
@@ -1829,8 +1879,9 @@ TEST(Dataset, commitSlicedMetadata) {
   std::filesystem::remove_all(TestStorePath("zarrs/acceptance"));
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
 
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
   auto dataset = datasetRes.value();
@@ -1862,8 +1913,8 @@ TEST(Dataset, commitSlicedMetadata) {
 TEST(Dataset, openNonExistent) {
   auto json_vars = GetToyExample();
 
-  auto datasetRes =
-      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/DNE"), mdio::constants::kOpen);
+  auto datasetRes = mdio::Dataset::from_json(
+      json_vars, TestStorePath("zarrs/DNE"), mdio::constants::kOpen);
   ASSERT_FALSE(datasetRes.status().ok())
       << "Opened a non-existent dataset without error!";
 }
@@ -1984,8 +2035,8 @@ TEST(Dataset, createSpecWithoutDatasetMetadataIsRejected) {
   json_vars["metadata"].erase("createdOn");
 
   auto created = mdio::Dataset::from_json(
-      json_vars, TestStorePath("zarrs/creation_no_metadata"), mdio::zarr::ZarrVersion::kV3,
-      mdio::constants::kCreateClean);
+      json_vars, TestStorePath("zarrs/creation_no_metadata"),
+      mdio::zarr::ZarrVersion::kV3, mdio::constants::kCreateClean);
   ASSERT_FALSE(created.status().ok())
       << "creation spec without dataset metadata must be rejected";
   EXPECT_THAT(created.status().message(),
@@ -1995,12 +2046,13 @@ TEST(Dataset, createSpecWithoutDatasetMetadataIsRejected) {
 TEST(Dataset, kCreateOverExisting) {
   auto json_vars = GetToyExample();
 
-  auto datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                             mdio::constants::kCreateClean);
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
   ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
 
-  datasetRes = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                        mdio::constants::kCreate);
+  datasetRes = mdio::Dataset::from_json(
+      json_vars, TestStorePath("zarrs/acceptance"), mdio::constants::kCreate);
   ASSERT_FALSE(datasetRes.status().ok())
       << "Created a dataset over an existing "
          "one without error!";
@@ -2042,6 +2094,274 @@ TEST(Dataset, mockV0) {
   ASSERT_FALSE(reopenedDsFut.status().ok())
       << "Opened a v0 dataset without error!" << std::endl
       << reopenedDsFut.value();
+}
+
+// A v0 marker that is not a string must still produce the v0 model error:
+// unguarded, get<std::string>() on the corrupt field aborts the process
+// instead of reporting the error result.
+TEST(Dataset, mockV0NonStringApiVersion) {
+  std::string path = TestStorePath("zarrs/acceptance");
+
+  auto json_vars = GetToyExample();
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, path, mdio::constants::kCreateClean);
+  ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
+
+  auto dataset = datasetRes.value();
+  const nlohmann::json& immutable_metadata = dataset.getMetadata();
+  nlohmann::json& mutable_metadata =
+      const_cast<nlohmann::json&>(immutable_metadata);
+  mutable_metadata["api_version"] = 1234;  // corrupt: not a string
+  mutable_metadata.erase("apiVersion");
+
+  // Touch a variable so CommitMetadata has something to persist.
+  nlohmann::json attrs = {{"foo", "bar"}};
+  auto varRes = dataset.get_variable("image");
+  ASSERT_TRUE(varRes.ok()) << varRes.status();
+  auto var = varRes.value();
+  auto varUpdateRes = var.UpdateAttributes<>(attrs);
+  ASSERT_TRUE(varUpdateRes.status().ok()) << varUpdateRes.status();
+
+  auto commitFut = dataset.CommitMetadata();
+  ASSERT_TRUE(commitFut.status().ok()) << commitFut.status();
+
+  auto reopenedDsFut = mdio::Dataset::Open(path, mdio::constants::kOpen);
+  ASSERT_FALSE(reopenedDsFut.status().ok())
+      << "Opened a v0 dataset with a non-string api_version without error!"
+      << std::endl
+      << reopenedDsFut.value();
+  EXPECT_EQ(reopenedDsFut.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+// ============================================================================
+// kCreateClean fast-path pre-delete (BestEffortPreDeleteLocalStore)
+// ============================================================================
+
+namespace {
+
+// A minimal variable spec carrying only what the pre-delete helper reads:
+// a local file kvstore whose path is `path`.
+::nlohmann::json MakeFileKvstoreSpec(const std::string& path) {
+  return ::nlohmann::json{{"kvstore", {{"driver", "file"}, {"path", path}}}};
+}
+
+}  // namespace
+
+// The pre-delete must mirror the stock per-variable DeleteRange scope: the
+// contents of each in-spec variable's own subtree go away (the variable
+// directory itself is kept), and nothing else under the common parent --
+// unrelated siblings, loose files -- is touched. The dataset-root metadata
+// files the create flow rewrites are removed for the spec's version.
+TEST(Dataset, FastPathPreDeleteScopedToVariableSubtrees) {
+  namespace fs = std::filesystem;
+  const std::string root = TestStorePath("fastpath/scope");
+  fs::remove_all(root);
+  fs::create_directories(root + "/image/0");
+  fs::create_directories(root + "/velocity/0");
+  std::ofstream(root + "/image/0/0") << "chunk";
+  std::ofstream(root + "/image/.zarray") << "{}";
+  std::ofstream(root + "/velocity/0/0") << "chunk";
+  fs::create_directories(root + "/user_notes");
+  std::ofstream(root + "/user_notes/readme.txt") << "keep";
+  std::ofstream(root + "/root_loose.txt") << "keep";
+  std::ofstream(root + "/.zmetadata") << "stale";
+  std::ofstream(root + "/.zgroup") << "{}";
+  std::ofstream(root + "/.zattrs") << "{}";
+
+  std::vector<::nlohmann::json> specs = {
+      MakeFileKvstoreSpec(root + "/image"),
+      MakeFileKvstoreSpec(root + "/velocity")};
+  mdio::internal::BestEffortPreDeleteLocalStore(specs);
+
+  EXPECT_TRUE(fs::exists(root + "/image"))
+      << "the variable directory itself must be kept (stock keeps it)";
+  EXPECT_TRUE(fs::exists(root + "/velocity"));
+  EXPECT_FALSE(fs::exists(root + "/image/0/0"));
+  EXPECT_FALSE(fs::exists(root + "/image/.zarray"));
+  EXPECT_FALSE(fs::exists(root + "/velocity/0/0"));
+  EXPECT_TRUE(fs::exists(root + "/user_notes/readme.txt"))
+      << "unrelated sibling content must survive the pre-delete";
+  EXPECT_TRUE(fs::exists(root + "/root_loose.txt"))
+      << "unrelated loose files must survive the pre-delete";
+  EXPECT_FALSE(fs::exists(root + "/.zmetadata"));
+  EXPECT_FALSE(fs::exists(root + "/.zgroup"));
+  EXPECT_FALSE(fs::exists(root + "/.zattrs"));
+}
+
+// A trailing slash on the kvstore path must not turn the variable
+// directory into the deletion root.
+TEST(Dataset, FastPathPreDeleteHandlesTrailingSlashPath) {
+  namespace fs = std::filesystem;
+  const std::string root = TestStorePath("fastpath/trailing");
+  fs::remove_all(root);
+  fs::create_directories(root + "/image/0");
+  std::ofstream(root + "/image/0/0") << "chunk";
+  fs::create_directories(root + "/user_notes");
+  std::ofstream(root + "/user_notes/readme.txt") << "keep";
+
+  std::vector<::nlohmann::json> specs = {MakeFileKvstoreSpec(root + "/image/")};
+  mdio::internal::BestEffortPreDeleteLocalStore(specs);
+
+  EXPECT_TRUE(fs::exists(root + "/image"));
+  EXPECT_FALSE(fs::exists(root + "/image/0/0"));
+  EXPECT_TRUE(fs::exists(root + "/user_notes/readme.txt"));
+}
+
+// Each gate fallback keeps the stock behavior: the helper is a no-op and
+// every pre-existing byte stays in place.
+TEST(Dataset, FastPathPreDeleteFallsBackToStock) {
+  namespace fs = std::filesystem;
+
+  // (a) A non-file driver anywhere in the spec set opts the whole open out.
+  {
+    const std::string root = TestStorePath("fastpath/fallback_mixed");
+    fs::remove_all(root);
+    fs::create_directories(root + "/image/0");
+    std::ofstream(root + "/image/0/0") << "chunk";
+    std::vector<::nlohmann::json> specs = {
+        MakeFileKvstoreSpec(root + "/image"),
+        ::nlohmann::json{
+            {"kvstore", {{"driver", "s3"}, {"bucket", "b"}, {"path", "p"}}}}};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+    EXPECT_TRUE(fs::exists(root + "/image/0/0"))
+        << "mixed drivers must keep the stock delete path";
+  }
+
+  // (b) Variables that disagree on the parent directory opt out.
+  {
+    const std::string root = TestStorePath("fastpath/fallback_parents");
+    fs::remove_all(root);
+    fs::create_directories(root + "/a/image/0");
+    fs::create_directories(root + "/b/velocity/0");
+    std::ofstream(root + "/a/image/0/0") << "chunk";
+    std::ofstream(root + "/b/velocity/0/0") << "chunk";
+    std::vector<::nlohmann::json> specs = {
+        MakeFileKvstoreSpec(root + "/a/image"),
+        MakeFileKvstoreSpec(root + "/b/velocity")};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+    EXPECT_TRUE(fs::exists(root + "/a/image/0/0"));
+    EXPECT_TRUE(fs::exists(root + "/b/velocity/0/0"))
+        << "disagreeing parents must keep the stock delete path";
+  }
+
+  // (c) A bare relative path (empty parent directory) opts out.
+  {
+    const std::string root = TestStorePath("fastpath/fallback_relative");
+    fs::remove_all(root);
+    fs::create_directories(root + "/image/0");
+    std::ofstream(root + "/image/0/0") << "chunk";
+    std::vector<::nlohmann::json> specs = {MakeFileKvstoreSpec("image")};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+    EXPECT_TRUE(fs::exists(root + "/image/0/0"))
+        << "empty parent must keep the stock delete path";
+  }
+
+  // (d) A missing store root is a no-op, not a crash.
+  {
+    const std::string root =
+        TestStorePath("fastpath/fallback_missing_root/missing");
+    fs::remove_all(TestStorePath("fastpath/fallback_missing_root"));
+    std::vector<::nlohmann::json> specs = {
+        MakeFileKvstoreSpec(root + "/image")};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+    EXPECT_FALSE(fs::exists(root))
+        << "nothing was created by the best-effort helper";
+  }
+}
+
+// The root metadata removal follows the spec's zarr version: a V3 spec
+// clears zarr.json and leaves V2's consolidated files alone.
+TEST(Dataset, FastPathPreDeleteVersionGatedRootMetadata) {
+  namespace fs = std::filesystem;
+  const std::string root = TestStorePath("fastpath/v3metadata");
+  fs::remove_all(root);
+  fs::create_directories(root + "/image");
+  std::ofstream(root + "/zarr.json") << "stale";
+  std::ofstream(root + "/.zmetadata") << "stale-v2";
+
+  ::nlohmann::json v3_spec = MakeFileKvstoreSpec(root + "/image");
+  v3_spec["driver"] = "zarr3";
+  std::vector<::nlohmann::json> specs = {v3_spec};
+  mdio::internal::BestEffortPreDeleteLocalStore(specs);
+
+  EXPECT_FALSE(fs::exists(root + "/zarr.json"));
+  EXPECT_TRUE(fs::exists(root + "/.zmetadata"))
+      << "a V3 spec must not delete V2 root metadata the stock flow "
+         "would leave in place";
+}
+
+// End to end: recreating a dataset with kCreateClean keeps unrelated
+// sibling content under the dataset root while stale files inside the
+// variable subtrees go away, and the recreated dataset still opens.
+TEST(Dataset, kCreateCleanRecreatePreservesUnrelatedSiblings) {
+  namespace fs = std::filesystem;
+  auto json_vars = GetToyExample();
+  const std::string path = TestStorePath("zarrs/fastpath_siblings");
+  fs::remove_all(path);
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, path, mdio::constants::kCreateClean);
+  ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
+
+  fs::create_directories(path + "/user_notes");
+  std::ofstream(path + "/user_notes/readme.txt") << "keep";
+  std::ofstream(path + "/image/stale.file") << "gone";
+  std::ofstream(path + "/root_note.txt") << "keep";
+
+  auto recreateRes =
+      mdio::Dataset::from_json(json_vars, path, mdio::constants::kCreateClean);
+  ASSERT_TRUE(recreateRes.status().ok()) << recreateRes.status();
+
+  EXPECT_TRUE(fs::exists(path + "/user_notes/readme.txt"))
+      << "unrelated sibling content must survive the recreate";
+  EXPECT_TRUE(fs::exists(path + "/root_note.txt"))
+      << "unrelated loose files must survive the recreate";
+  EXPECT_FALSE(fs::exists(path + "/image/stale.file"))
+      << "stale files inside a variable subtree must be removed";
+
+  auto reopened = mdio::Dataset::Open(path, mdio::constants::kOpen);
+  ASSERT_TRUE(reopened.status().ok()) << reopened.status();
+  auto imageRes = reopened.value().variables.at("image");
+  ASSERT_TRUE(imageRes.status().ok()) << imageRes.status();
+}
+
+// End to end: a spec that fails the mdio-level validation must leave the
+// old store untouched. Stock deletes existing data only after that
+// validation (inside each per-variable Open), so the pre-delete must be
+// gated the same way -- without the gate this test wiped the store.
+TEST(Dataset, kCreateCleanInvalidSpecLeavesStoreIntact) {
+  namespace fs = std::filesystem;
+  auto json_vars = GetToyExample();
+  const std::string path = TestStorePath("zarrs/fastpath_gate");
+  fs::remove_all(path);
+  auto datasetRes =
+      mdio::Dataset::from_json(json_vars, path, mdio::constants::kCreateClean);
+  ASSERT_TRUE(datasetRes.status().ok()) << datasetRes.status();
+  ASSERT_TRUE(fs::exists(path + "/zarr.json"));
+
+  // A marker inside a variable subtree proves the pre-delete did not run:
+  // both the fast path and the stock per-variable delete would remove it.
+  std::ofstream(path + "/image/marker.txt") << "intact";
+
+  // A spec that passes Construct-level shaping but fails the mdio-level
+  // variable validation: attributes present, dimension_names missing.
+  ::nlohmann::json bad_spec = {
+      {"driver", "zarr"},
+      {"kvstore", {{"driver", "file"}, {"path", path + "/image"}}},
+      {"attributes", {{"variable_name", "image"}, {"long_name", "image"}}},
+  };
+  std::vector<::nlohmann::json> bad_specs = {bad_spec};
+
+  auto openRes =
+      mdio::Dataset::Open(bad_spec, bad_specs, mdio::constants::kCreateClean);
+  ASSERT_FALSE(openRes.status().ok())
+      << "a spec without dimension_names must be rejected";
+
+  EXPECT_TRUE(fs::exists(path + "/zarr.json"))
+      << "root metadata must survive a validation failure";
+  EXPECT_TRUE(fs::exists(path + "/image/zarr.json"))
+      << "variable metadata must survive a validation failure";
+  EXPECT_TRUE(fs::exists(path + "/image/marker.txt"))
+      << "the pre-delete must not run when mdio-level validation fails";
 }
 
 // ============================================================================
@@ -2233,9 +2553,9 @@ TEST(DatasetVersionNullopt, fromJsonWithNulloptVersion) {
   auto json_vars = GetToyExample();
 
   std::optional<mdio::zarr::ZarrVersion> version = std::nullopt;
-  auto dataset =
-      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/nullopt_version"), version,
-                               mdio::constants::kCreateClean);
+  auto dataset = mdio::Dataset::from_json(
+      json_vars, TestStorePath("zarrs/nullopt_version"), version,
+      mdio::constants::kCreateClean);
 
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   EXPECT_EQ(dataset.value().getMetadata()["name"], "campos_3d");
@@ -2245,8 +2565,9 @@ TEST(DatasetVersionNullopt, fromJsonWithNulloptVersion) {
 
 TEST(Dataset, iselWithEmptySlicesVector) {
   auto json_vars = GetToyExample();
-  auto dataset = mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
-                                          mdio::constants::kCreateClean);
+  auto dataset =
+      mdio::Dataset::from_json(json_vars, TestStorePath("zarrs/acceptance"),
+                               mdio::constants::kCreateClean);
   ASSERT_TRUE(dataset.status().ok()) << dataset.status();
   auto ds = dataset.value();
 
