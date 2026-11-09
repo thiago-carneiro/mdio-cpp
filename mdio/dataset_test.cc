@@ -29,6 +29,7 @@
 #include "absl/log/internal/log_sink_set.h"
 #include "absl/log/log_sink.h"
 #include "mdio/dataset_factory.h"
+#include "mdio/internal/local_store_delete.h"
 #include "mdio/zarr/zarr.h"
 #include "tensorstore/driver/driver.h"
 #include "tensorstore/driver/registry.h"
@@ -2150,8 +2151,7 @@ namespace {
 // The pre-delete must mirror the stock per-variable DeleteRange scope: the
 // contents of each in-spec variable's own subtree go away (the variable
 // directory itself is kept), and nothing else under the common parent --
-// unrelated siblings, loose files -- is touched. The dataset-root metadata
-// files the create flow rewrites are removed for the spec's version.
+// unrelated siblings, loose files, dataset-root metadata -- is touched.
 TEST(Dataset, FastPathPreDeleteScopedToVariableSubtrees) {
   namespace fs = std::filesystem;
   const std::string root = TestStorePath("fastpath/scope");
@@ -2183,9 +2183,9 @@ TEST(Dataset, FastPathPreDeleteScopedToVariableSubtrees) {
       << "unrelated sibling content must survive the pre-delete";
   EXPECT_TRUE(fs::exists(root + "/root_loose.txt"))
       << "unrelated loose files must survive the pre-delete";
-  EXPECT_FALSE(fs::exists(root + "/.zmetadata"));
-  EXPECT_FALSE(fs::exists(root + "/.zgroup"));
-  EXPECT_FALSE(fs::exists(root + "/.zattrs"));
+  EXPECT_TRUE(fs::exists(root + "/.zmetadata"));
+  EXPECT_TRUE(fs::exists(root + "/.zgroup"));
+  EXPECT_TRUE(fs::exists(root + "/.zattrs"));
 }
 
 // A trailing slash on the kvstore path must not turn the variable
@@ -2269,25 +2269,113 @@ TEST(Dataset, FastPathPreDeleteFallsBackToStock) {
   }
 }
 
-// The root metadata removal follows the spec's zarr version: a V3 spec
-// clears zarr.json and leaves V2's consolidated files alone.
-TEST(Dataset, FastPathPreDeleteVersionGatedRootMetadata) {
+// The dataset-root metadata files are never touched by the pre-delete,
+// for either zarr version: the stock flow only ever overwrites them, and
+// deleting them up front would leave a partial store unrecognizable when
+// a create fails after the fast pass.
+TEST(Dataset, FastPathPreDeleteLeavesRootMetadataForStockRewrite) {
   namespace fs = std::filesystem;
-  const std::string root = TestStorePath("fastpath/v3metadata");
-  fs::remove_all(root);
-  fs::create_directories(root + "/image");
-  std::ofstream(root + "/zarr.json") << "stale";
-  std::ofstream(root + "/.zmetadata") << "stale-v2";
 
-  ::nlohmann::json v3_spec = MakeFileKvstoreSpec(root + "/image");
-  v3_spec["driver"] = "zarr3";
-  std::vector<::nlohmann::json> specs = {v3_spec};
-  mdio::internal::BestEffortPreDeleteLocalStore(specs);
+  // A V3 spec leaves both V3's root marker and any V2 files alone.
+  {
+    const std::string root = TestStorePath("fastpath/v3metadata");
+    fs::remove_all(root);
+    fs::create_directories(root + "/image");
+    std::ofstream(root + "/zarr.json") << "stale";
+    std::ofstream(root + "/.zmetadata") << "stale-v2";
 
-  EXPECT_FALSE(fs::exists(root + "/zarr.json"));
-  EXPECT_TRUE(fs::exists(root + "/.zmetadata"))
-      << "a V3 spec must not delete V2 root metadata the stock flow "
-         "would leave in place";
+    ::nlohmann::json v3_spec = MakeFileKvstoreSpec(root + "/image");
+    v3_spec["driver"] = "zarr3";
+    std::vector<::nlohmann::json> specs = {v3_spec};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+
+    EXPECT_TRUE(fs::exists(root + "/zarr.json"))
+        << "the stock flow rewrites the root metadata, it never deletes it";
+    EXPECT_TRUE(fs::exists(root + "/.zmetadata"))
+        << "a V3 spec must not delete V2 root metadata the stock flow "
+           "would leave in place";
+  }
+
+  // A V2 spec likewise leaves all root metadata in place.
+  {
+    const std::string root = TestStorePath("fastpath/v2metadata");
+    fs::remove_all(root);
+    fs::create_directories(root + "/image");
+    std::ofstream(root + "/.zmetadata") << "stale";
+    std::ofstream(root + "/.zgroup") << "{}";
+    std::ofstream(root + "/.zattrs") << "{}";
+
+    std::vector<::nlohmann::json> specs = {
+        MakeFileKvstoreSpec(root + "/image")};
+    mdio::internal::BestEffortPreDeleteLocalStore(specs);
+
+    EXPECT_TRUE(fs::exists(root + "/.zmetadata"));
+    EXPECT_TRUE(fs::exists(root + "/.zgroup"));
+    EXPECT_TRUE(fs::exists(root + "/.zattrs"));
+  }
+}
+
+// Regression: a failure AFTER the fast pre-delete must leave the store
+// recognizable. The stock flow's own failure window (its per-variable
+// DeleteRange runs before the root-metadata rewrite) empties variable
+// subtrees but never touches the dataset-root metadata, so a partial
+// store still opens far enough for zarr::DetectVersion to name its
+// version; with the old fast path also unlinking the root metadata, the
+// same failure window produced a store DetectVersion rejected as "not an
+// MDIO store or path does not exist". This simulates the window: create
+// a real dataset, run the pre-delete on its Open-level specs, then assert
+// the store is still recognized and the root metadata survived.
+TEST(Dataset, FastPathPreDeleteFailureLeavesStoreRecognizable) {
+  namespace fs = std::filesystem;
+  for (const auto version :
+       {mdio::zarr::ZarrVersion::kV2, mdio::zarr::ZarrVersion::kV3}) {
+    SCOPED_TRACE(ZarrVersionToString(version));
+    const std::string path =
+        TestStorePath("zarrs/fastpath_failure_" + ZarrVersionToString(version));
+    fs::remove_all(path);
+    auto json_vars = GetToyExample();
+    auto dataset = mdio::Dataset::from_json(json_vars, path, version,
+                                            mdio::constants::kCreateClean);
+    ASSERT_TRUE(dataset.status().ok()) << dataset.status();
+    std::ofstream(path + "/root_note.txt") << "keep";
+
+    // The Open-level specs carry the kvstore each variable opens.
+    std::vector<::nlohmann::json> open_specs;
+    for (const auto& name : dataset.value().variables.get_keys()) {
+      auto var = dataset.value().variables.at(name);
+      ASSERT_TRUE(var.status().ok()) << var.status();
+      auto spec = var.value().get_spec();
+      ASSERT_TRUE(spec.status().ok()) << spec.status();
+      open_specs.push_back(
+          ::nlohmann::json{{"kvstore", spec.value()["kvstore"]}});
+    }
+
+    // Simulate the failure window: the fast pre-delete ran and the create
+    // never reached the metadata rewrite or the variable recreation.
+    mdio::internal::BestEffortPreDeleteLocalStore(open_specs);
+
+    // Root metadata intact, so the store is still recognizable. Resolve
+    // the kvstore the way the production open path does (the file driver
+    // path is normalized with a trailing slash there).
+    auto kvs_result = mdio::internal::dataset_kvs_store(path).result();
+    ASSERT_TRUE(kvs_result.ok()) << kvs_result.status();
+    auto version_future = mdio::zarr::DetectVersion(kvs_result.value());
+    ASSERT_TRUE(version_future.status().ok())
+        << "a post-pre-delete store must still be recognized as an MDIO "
+           "store: "
+        << version_future.status();
+    EXPECT_EQ(version_future.value(), version);
+
+    if (version == mdio::zarr::ZarrVersion::kV2) {
+      EXPECT_TRUE(fs::exists(path + "/.zmetadata"));
+      EXPECT_TRUE(fs::exists(path + "/.zgroup"));
+      EXPECT_TRUE(fs::exists(path + "/.zattrs"));
+    } else {
+      EXPECT_TRUE(fs::exists(path + "/zarr.json"));
+    }
+    EXPECT_TRUE(fs::exists(path + "/root_note.txt"))
+        << "unrelated root files must survive the pre-delete";
+  }
 }
 
 // End to end: recreating a dataset with kCreateClean keeps unrelated
