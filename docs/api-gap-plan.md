@@ -390,6 +390,37 @@ fixed in M7 via the variable index — not missing parallelism (K=8 did not
 degrade). Downstream keeps external orchestration (Parsl/Slurm).
 Re-evaluate only if a measured per-task cost reappears after M7.)*
 
+*(Implemented, wave 6 — `mdio/execution.h` (`ParallelOptions`,
+`ChunkView`, `MapChunks`), spec at `docs/api-gap-m6-execution-layer.md`,
+measurement report at
+`/tgdesenv/src/proj0/u4w7/home2/tmp/py-enforcer/panel/m6-measurements.md`.
+Design where the proposal was silent: fn is a per-chunk callback receiving
+index + absolute box + a contiguous mutable buffer, returning a Status —
+per-chunk VALUES flow through caller-owned captured state (the stats
+flow); the future's result is one status per chunk in row-major order
+(`Future<vector<absl::Status>>`). Errors are continue-on-error with
+per-chunk reporting, so the set of written chunks never depends on the
+worker count. Two premises corrected at implementation: (1) the fused
+union-region read makes in-chunk views STRIDED — the contiguous-buffer
+extraction (one memcpy/chunk) is what keeps the C-contiguous callback
+contract and byte-identity (caught by the parallel-equivalence test, not
+by the serial ones); (2) an upfront read-only fail-fast is not
+implementable through the dynamic-mode `Variable<>` — the read-only tag
+does not survive mdio's conversion (measured), so write_back follows the
+exact constraint profile of `Variable::Write`. Handle reuse and the
+metadata cache are fixed policies (one open Variable, one shared Context —
+the proposal's "open-handle reuse" and "metadata caching" requirements are
+satisfied by the substrate, not by knobs). NFS gates (gr15sdes01, 128
+chunk files, ~119 MB RMW, medians of 5): serial per-chunk loop 2689 ms →
+MapChunks 254 ms at w=32 (10.6×), 295 ms at w=16, 756 ms at w=4 (3.6×);
+one inline (16 chunks) 375 → 102 ms; openat=1497/getdents64=0 IDENTICAL
+across all arms — the win is latency overlap only, exactly the M7
+premise. Defaults measured: chunks_per_task=4, max_workers=
+hardware_concurrency. Suites: execution_test 10/10 (serial byte-identity,
+fusion invariants, no-lock race exercise, failure paths, struct
+field/void-view, read-mode semantics), full ctest 16/16 green; the gate
+driver `run_m6_gates.py` carries its own unit tests.)*
+
 ## M7 — Metadata-path performance (measured bottleneck)
 
 The evaluation measured the dominant I/O cost in the per-task metadata

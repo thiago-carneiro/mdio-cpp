@@ -463,6 +463,29 @@ mdio_cc_test(
 
 mdio_cc_test(
   NAME
+    execution_test
+  SRCS
+    execution_test.cc
+  COPTS
+    ${mdio_DEFAULT_COPTS}
+  LINKOPTS
+    ${mdio_DEFAULT_LINKOPTS}
+  DEPS
+    GTest::gmock_main
+    tensorstore::driver_array
+    tensorstore::driver_zarr
+    tensorstore::driver_zarr3
+    tensorstore::driver_json
+    tensorstore::kvstore_file
+    tensorstore::stack
+    tensorstore::tensorstore
+    tensorstore::index_space_dim_expression
+    tensorstore::index_space_index_transform
+    tensorstore::util_status_testutil
+)
+
+mdio_cc_test(
+  NAME
     coordinate_selector_test
   SRCS
     coordinate_selector_test.cc
@@ -569,5 +592,30 @@ if(MDIO_BUILD_BENCHMARKS)
   )
   # mdio libraries require C++17 as the current minimum standard.
   target_compile_features(mdio_nfs_metadata_bench PUBLIC cxx_std_17)
+
+  add_executable(mdio_m6_map_chunks_bench
+    benchmark/m6_map_chunks_bench.cpp
+  )
+  target_include_directories(mdio_m6_map_chunks_bench
+    PUBLIC ${mdio_COMMON_INCLUDE_DIRS}
+  )
+  target_compile_options(mdio_m6_map_chunks_bench
+    PRIVATE ${mdio_DEFAULT_COPTS}
+  )
+  target_link_libraries(mdio_m6_map_chunks_bench
+    PUBLIC
+      tensorstore::driver_array
+      tensorstore::driver_zarr
+      tensorstore::driver_zarr3
+      tensorstore::driver_json
+      tensorstore::kvstore_file
+      tensorstore::stack
+      tensorstore::tensorstore
+      tensorstore::index_space_dim_expression
+      tensorstore::index_space_index_transform
+      nlohmann_json_schema_validator
+  )
+  target_compile_features(mdio_m6_map_chunks_bench PUBLIC cxx_std_17)
 endif()
+
 
